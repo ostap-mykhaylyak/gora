@@ -1,0 +1,31 @@
+[Unit]
+Description=gora - MySQL proxy for WordPress and WooCommerce
+Documentation=https://github.com/ostap-mykhaylyak/gora
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gora
+Group=gora
+ExecStart=/sbin/gora start --config /etc/gora/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/log/gora
+RuntimeDirectory=gora
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

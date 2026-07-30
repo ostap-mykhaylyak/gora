@@ -1,0 +1,27 @@
+# gora configuration
+# Written by `gora --init`. The previous file, if any, was saved as
+# config.yaml.bak next to this one.
+
+listen:
+  # Address WordPress connects to (DB_HOST in wp-config.php).
+  address: "0.0.0.0:3306"
+  # Cap on concurrent client connections (0 = unlimited). Connections beyond
+  # the cap are refused immediately instead of piling up.
+  max_connections: 0
+
+backend:
+  # The MySQL server gora forwards to. Backend connections belong to gora
+  # and are shared by every client session.
+  address: "10.0.0.10:3306"
+  username: "wordpress"
+  password: "change-me"
+
+status:
+  # Local unix socket exposing runtime state to `gora status` (read-only).
+  # Empty disables it.
+  socket: /run/gora/status.sock
+
+log:
+  level: info           # debug | info | warn | error
+  format: text          # text | json
+  path: /var/log/gora   # directory for gora.log ("stdout"/"stderr" for the console)

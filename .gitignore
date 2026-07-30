@@ -1,0 +1,22 @@
+# Binaries and release artifacts
+bin/
+dist/
+/gora
+/gora.exe
+
+# Local configuration (cmd/gora/config.default.yaml is the tracked template)
+config.yaml
+
+# Test and coverage output
+*.test
+*.out
+coverage.html
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# OS noise
+.DS_Store
+Thumbs.db
