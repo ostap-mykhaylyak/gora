@@ -8,6 +8,13 @@ listen:
   # Cap on concurrent client connections (0 = unlimited). Connections beyond
   # the cap are refused immediately instead of piling up.
   max_connections: 0
+  # How long a shutdown waits for the statements already running before it
+  # closes client connections anyway. Idle sessions are not waited for.
+  drain_timeout: 10s
+  # Encrypt client connections (both files are required to enable it).
+  # tls:
+  #   cert: /etc/gora/server.crt
+  #   key: /etc/gora/server.key
 
 backend:
   # The MySQL server gora forwards to. Backend connections belong to gora
@@ -15,6 +22,58 @@ backend:
   address: "10.0.0.10:3306"
   username: "wordpress"
   password: "change-me"
+  # How long a single connection attempt may take.
+  connect_timeout: 5s
+  # Encrypt the connection toward MySQL (for a remote database).
+  # tls:
+  #   enabled: true
+  #   ca: /etc/gora/mysql-ca.pem   # optional; omit to use the system roots
+  #   skip_verify: false           # true accepts self-signed certificates
+
+# Optional: the accounts WordPress authenticates with against gora. MySQL
+# never sees these credentials, so they can differ from the real database
+# ones and wp-config.php never has to carry them. Omit this section and
+# clients authenticate with the backend credentials above.
+#
+# users:
+#   - username: "wordpress"
+#     password: "proxy-only-password"
+
+pool:
+  # Cap on backend connections (in use + idle).
+  max_open: 100
+  # Connections kept parked for reuse.
+  max_idle: 10
+  # Connections opened at startup and kept available, so the first visitors
+  # after a restart do not pay for the handshake.
+  min_idle: 0
+  # How often idle connections receive a COM_PING so MySQL's wait_timeout
+  # never closes them ("MySQL server has gone away"). Applies both to parked
+  # connections and to connections attached to an inactive client.
+  ping_interval: 30s
+  # Close parked connections unused for this long (0 = never), down to
+  # min_idle.
+  idle_timeout: 5m
+  # Retire a connection this long after it was opened (0 = never). This is
+  # what makes a MySQL restart or a failover heal on its own.
+  max_lifetime: 1h
+  # How long a client waits for a connection when the pool is exhausted.
+  acquire_timeout: 5s
+  # Return the backend connection to the pool between statements: many PHP
+  # workers share few real MySQL connections. Sessions holding state
+  # (transactions, temporary tables, locks, prepared statements, user
+  # variables) keep their connection automatically.
+  multiplexing: true
+  # Kill backend statements running longer than this (0 disables it), so one
+  # runaway query cannot hold a pooled connection hostage. KILL QUERY only
+  # interrupts the statement: the client gets an error, the session lives.
+  max_query_time: 0
+  # Circuit breaker: after this many consecutive connection failures gora
+  # fails fast instead of letting every PHP worker wait for its own timeout,
+  # and probes the backend until it recovers. failures: 0 disables it.
+  breaker:
+    failures: 3
+    probe_interval: 2s
 
 status:
   # Local unix socket exposing runtime state to `gora status` (read-only).

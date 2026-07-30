@@ -74,6 +74,11 @@ func TestValidate(t *testing.T) {
 		{"listen without a port", minimal + "\nlisten:\n  address: \"0.0.0.0\"\n", "port"},
 		{"negative connection cap", minimal + "\nlisten:\n  max_connections: -1\n", "max_connections"},
 		{"relative status socket", minimal + "\nstatus:\n  socket: \"gora.sock\"\n", "absolute"},
+		{"idle above open", minimal + "\npool:\n  max_open: 4\n  max_idle: 8\n", "pool.max_idle"},
+		{"min idle above open", minimal + "\npool:\n  max_open: 4\n  max_idle: 4\n  min_idle: 8\n", "pool.min_idle"},
+		{"zero connect timeout", "backend:\n  address: \"127.0.0.1:3306\"\n  username: \"u\"\n  connect_timeout: 0\n", "connect_timeout"},
+		{"tls configured but disabled", "backend:\n  address: \"127.0.0.1:3306\"\n  username: \"u\"\n  tls:\n    ca: /etc/gora/ca.pem\n", "backend.tls.enabled"},
+		{"user without a name", minimal + "\nusers:\n  - password: \"x\"\n", "users[0].username"},
 		{"unknown log level", minimal + "\nlog:\n  level: \"verbose\"\n", "log.level"},
 		{"unknown log format", minimal + "\nlog:\n  format: \"xml\"\n", "log.format"},
 		{"empty log path", minimal + "\nlog:\n  path: \"\"\n", "log.path"},
@@ -89,6 +94,31 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("error %q does not mention %q", err, tt.want)
 			}
 		})
+	}
+}
+
+// A lifetime shorter than the ping interval retires connections as fast as
+// they are opened, which looks like a mysterious churn rather than a
+// misconfiguration — so it is refused with the reason spelled out.
+func TestMaxLifetimeMustExceedPingInterval(t *testing.T) {
+	_, err := Load(write(t, minimal+"\npool:\n  ping_interval: 30s\n  max_lifetime: 10s\n"))
+	if err == nil {
+		t.Fatal("a max_lifetime shorter than ping_interval was accepted")
+	}
+	if !strings.Contains(err.Error(), "max_lifetime") {
+		t.Fatalf("error %q does not mention max_lifetime", err)
+	}
+}
+
+// Without a users section, clients authenticate with the backend
+// credentials: the simple installation needs them written down once.
+func TestUsersDefaultToTheBackendCredentials(t *testing.T) {
+	cfg, err := Load(write(t, minimal))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Users) != 1 || cfg.Users[0].Username != "wordpress" || cfg.Users[0].Password != "secret" {
+		t.Fatalf("users = %+v, want the backend credentials", cfg.Users)
 	}
 }
 

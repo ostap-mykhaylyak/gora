@@ -15,10 +15,13 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/proxy"
 )
 
 // Snapshot is the state of a running instance. It grows with every
-// milestone: pool, cache and topology sections land with the features they
+// milestone: the cache and topology sections land with the features they
 // describe.
 type Snapshot struct {
 	Version       string `json:"version"`
@@ -27,6 +30,9 @@ type Snapshot struct {
 	ConfigPath    string `json:"config_path"`
 	Listen        string `json:"listen"`
 	Backend       string `json:"backend"`
+
+	Clients proxy.Stats `json:"clients"`
+	Pool    pool.Stats  `json:"pool"`
 }
 
 // Uptime returns the uptime as a duration.

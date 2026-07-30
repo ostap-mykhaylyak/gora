@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/ostap-mykhaylyak/gora/internal/config"
+	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/proxy"
 	"github.com/ostap-mykhaylyak/gora/internal/status"
 )
 
@@ -52,16 +55,43 @@ func start(configPath string, stdout io.Writer) error {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
+	if cfg.Log.Console() {
+		fmt.Fprintf(stdout, "gora %s started (pid %d)\n", version, os.Getpid())
+	}
+	return serve(ctx, cfg, configPath, log)
+}
+
+// serve runs everything gora is made of until ctx is cancelled. It is
+// separate from start so that the tests can drive the whole assembly —
+// pool, listener, status socket — with a context of their own.
+func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.Logger) error {
 	started := time.Now()
 	log.Info("gora started",
 		"version", version, "pid", os.Getpid(), "config", configPath,
 		"listen", cfg.Listen.Address, "backend", cfg.Backend.Address)
-	if cfg.Log.Console() {
-		fmt.Fprintf(stdout, "gora %s started (pid %d)\n", version, os.Getpid())
+
+	backendPool, err := pool.New(cfg.Backend, cfg.Pool, log, nil)
+	if err != nil {
+		return err
 	}
-	// Said plainly rather than discovered by tcpdump: this build has no data
-	// plane yet, the listener arrives with the proxy milestone.
-	log.Warn("this build does not proxy traffic yet: no client listener is open")
+	defer backendPool.Close()
+
+	listenTLS, err := clientTLS(cfg.Listen)
+	if err != nil {
+		return err
+	}
+	if listenTLS != nil {
+		log.Info("client TLS enabled", "cert", cfg.Listen.TLS.Cert)
+	}
+
+	srv := proxy.New(proxy.Options{
+		Listen:  cfg.Listen,
+		Users:   cfg.Users,
+		PoolCfg: cfg.Pool,
+		Pool:    backendPool,
+		TLS:     listenTLS,
+		Log:     log,
+	})
 
 	if cfg.Status.Socket != "" {
 		collect := func() status.Snapshot {
@@ -72,6 +102,8 @@ func start(configPath string, stdout io.Writer) error {
 				ConfigPath:    configPath,
 				Listen:        cfg.Listen.Address,
 				Backend:       cfg.Backend.Address,
+				Clients:       srv.Stat(),
+				Pool:          backendPool.Stat(),
 			}
 		}
 		go func() {
@@ -83,9 +115,23 @@ func start(configPath string, stdout io.Writer) error {
 
 	go watchReloads(ctx, configPath, log)
 
-	<-ctx.Done()
+	if err := srv.Run(ctx); err != nil {
+		return err
+	}
 	log.Info("shutdown complete")
 	return nil
+}
+
+// clientTLS loads the certificate gora presents to clients, if configured.
+func clientTLS(cfg config.Listen) (*tls.Config, error) {
+	if !cfg.TLS.Enabled() {
+		return nil, nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.TLS.Cert, cfg.TLS.Key)
+	if err != nil {
+		return nil, fmt.Errorf("loading listen.tls certificate: %w", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 }
 
 // watchReloads re-reads the configuration on every SIGHUP. A configuration
@@ -175,7 +221,25 @@ func printStatus(configPath string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "gora %s, pid %d, up %s\n", snap.Version, snap.PID, snap.Uptime())
 	fmt.Fprintf(stdout, "config:   %s\n", snap.ConfigPath)
 	fmt.Fprintf(stdout, "listen:   %s\n", snap.Listen)
-	fmt.Fprintf(stdout, "backend:  %s\n", snap.Backend)
+	fmt.Fprintf(stdout, "clients:  %d connected, %d pinned, %d statements running\n",
+		snap.Clients.Clients, snap.Clients.Pinned, snap.Clients.Active)
+
+	breaker := "closed (backend healthy)"
+	if snap.Pool.BreakerOpen {
+		breaker = "OPEN (backend unreachable)"
+	}
+	fmt.Fprintf(stdout, "backend:  %s, %d/%d connections open, %d idle, breaker %s\n",
+		snap.Backend, snap.Pool.Open, snap.Pool.MaxOpen, snap.Pool.Idle, breaker)
+	fmt.Fprintf(stdout, "pool:     %d dials, %d closed, %d retired\n",
+		snap.Pool.Dials, snap.Pool.Discards, snap.Pool.Retired)
+	// Waits are the number that says max_open is too small; without them the
+	// average is noise, so it is only printed when there were any.
+	if snap.Pool.Waits > 0 {
+		fmt.Fprintf(stdout, "          %d waits (avg %.1f ms), %d timed out\n",
+			snap.Pool.Waits, snap.Pool.AvgWaitMillis, snap.Pool.WaitTimeouts)
+	} else {
+		fmt.Fprintln(stdout, "          no client ever waited for a connection")
+	}
 	return nil
 }
 
@@ -195,6 +259,13 @@ func checkConfig(configPath string, stdout io.Writer) error {
 	}
 	fmt.Fprintln(stdout)
 	fmt.Fprintf(stdout, "  backend:  %s as %s\n", cfg.Backend.Address, cfg.Backend.Username)
+	fmt.Fprintf(stdout, "  clients:  %d account(s) authenticate against gora\n", len(cfg.Users))
+	multiplexing := "off (one backend connection per session)"
+	if cfg.Pool.Multiplexing {
+		multiplexing = "on (connections shared between statements)"
+	}
+	fmt.Fprintf(stdout, "  pool:     max %d, idle %d-%d, multiplexing %s\n",
+		cfg.Pool.MaxOpen, cfg.Pool.MinIdle, cfg.Pool.MaxIdle, multiplexing)
 	socket := cfg.Status.Socket
 	if socket == "" {
 		socket = "disabled"
