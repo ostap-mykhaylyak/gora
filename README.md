@@ -67,6 +67,22 @@ water, MySQL is the mill.
   drop-ins without dropping a single client connection, so adding a rule
   during an incident does not mean a restart. A drop-in that no longer
   parses is reported and the previous rules stay in force.
+- **Query rewriting** — regex replacements applied before execution, for the
+  SQL you cannot fix at the source: a plugin you did not write, a theme
+  nobody maintains. Rewrites change what the database is asked, so none ship
+  enabled. Prepared statements are never rewritten.
+- **Query firewall** — a `block` rule refuses matching statements with a
+  clean MySQL error before they reach the backend. With hot reload it is the
+  emergency brake for a runaway plugin query: add the rule, reload, done.
+  Arm it with `dry_run: true` first and it reports what it would have
+  refused without refusing anything.
+- **Per-statement throttling** — a `throttle` rule bounds how many copies of
+  the same statement run at once. It is the brake for the query that is not
+  wrong, only ruinous in quantity: the excess waits for `wait` and is then
+  refused, so the site stays slow instead of going down. Limits apply per
+  statement shape — literals are normalised away — so one runaway query is
+  held back without touching everything else the rule matches. A cache hit
+  costs the database nothing and never needs a slot.
 - **Circuit breaker** — when MySQL is down, waiting for per-request timeouts
   melts PHP-FPM. After `pool.breaker.failures` consecutive failures gora
   fails fast with a clean error and probes the backend until it recovers.
@@ -193,28 +209,54 @@ users:
 Unknown keys are an error, not a warning: a typo must never leave a default
 silently in place.
 
-### Cache rules (conf.d)
+### Rules (conf.d)
 
-Every `*.yaml` file in `/etc/gora/conf.d/` adds rules. A rule caches the
-SELECTs matching an RE2 expression and drops them when a write touches one
-of its `invalidate_on` tables:
+Every `*.yaml` file in `/etc/gora/conf.d/` declares what gora does with
+traffic, in four sections. `{prefix}` expands to the table prefix, and RE2
+is the expression syntax throughout.
 
 ```yaml
 name: my-rules
+
+# Cache these reads, drop them when these tables are written.
 rules:
   - name: attribute-taxonomies
     match: "(?i)^SELECT \\* FROM {prefix}woocommerce_attribute_taxonomies"
     ttl: 30m
     invalidate_on: ["{prefix}woocommerce_attribute_taxonomies"]
+
+# Change this statement before it runs.
+rewrites:
+  - name: drop-order-by-rand
+    match: "(?i)\\s*ORDER\\s+BY\\s+RAND\\s*\\(\\s*\\)"
+    replace: ""
+
+# Refuse this statement. dry_run reports instead of refusing.
+block:
+  - name: no-truncate
+    match: "(?i)^TRUNCATE"
+    message: "TRUNCATE is not allowed through gora"
+    dry_run: false
+
+# Let at most two of these run at once; the rest wait a second, then fail.
+throttle:
+  - name: product-search
+    match: "(?i)LIKE '%"
+    max_concurrent: 2
+    wait: 1s
 ```
 
-`invalidate_on` is required: a rule without it serves stale rows until its
-TTL expires, which is never what the author meant. Apply changes with
-`systemctl reload gora`, and check them first with `gora --check-config`,
-which loads the drop-ins and lists the rules it found.
+`invalidate_on` is required on a cache rule: one without it serves stale
+rows until its TTL expires, which is never what the author meant. Apply
+changes with `systemctl reload gora` — connections are not dropped — and
+check them first with `gora --check-config`, which compiles every section
+and lists what it found.
 
-Only add rules for queries whose answer is the same for every visitor. Never
-cache per-customer data — carts, sessions, orders.
+Files are read in filename order, so `10-base.yaml` and `20-overrides.yaml`
+behave the way the numbers suggest. Names must be unique within a section.
+
+Only cache queries whose answer is the same for every visitor. Never cache
+per-customer data — carts, sessions, orders.
 
 ## Current limitations
 
@@ -231,8 +273,8 @@ cache per-customer data — carts, sessions, orders.
 |---|---|---|
 | ~~M0~~ | skeleton | CLI, configuration, logging, service control, `--init`, status socket, CI |
 | ~~M1~~ | data plane | MySQL protocol, connection pool, keepalive, per-query multiplexing, TLS |
-| **M2** | cache | WordPress-aware query cache, conf.d rules, hot reload, warm-up |
-| M3 | traffic | query rewriting, firewall, per-digest throttling |
+| ~~M2~~ | cache | WordPress-aware query cache, conf.d rules, hot reload, warm-up |
+| **M3** | traffic | query rewriting, firewall, per-digest throttling |
 | M4 | profiling | slow query log, aggregated report, index and rewrite advisor |
 | M5 | topology | multiple nodes, health checks, read/write split, degraded mode |
 | M6 | replication | GTID provisioning, seeding, monitoring, failover |

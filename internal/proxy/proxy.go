@@ -20,18 +20,25 @@ import (
 
 	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
+	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
+	"github.com/ostap-mykhaylyak/gora/internal/throttle"
 )
 
-// Options wires the Server's collaborators. Cache and TLS are optional.
+// Options wires the Server's collaborators. Everything but the pool is
+// optional: a nil collaborator is a feature that is off.
 type Options struct {
-	Listen  config.Listen
-	Users   []config.User
-	PoolCfg config.Pool
-	Pool    *pool.Pool
-	Cache   *cache.Cache // nil disables the query cache
-	TLS     *tls.Config  // client-facing TLS, advertised when non-nil
-	Log     *slog.Logger
+	Listen   config.Listen
+	Users    []config.User
+	PoolCfg  config.Pool
+	Pool     *pool.Pool
+	Cache    *cache.Cache // nil disables the query cache
+	Rewriter *rewrite.Rewriter
+	Firewall *firewall.Firewall
+	Throttle *throttle.Limiter
+	TLS      *tls.Config // client-facing TLS, advertised when non-nil
+	Log      *slog.Logger
 }
 
 // Server accepts client connections and serves the MySQL protocol.
@@ -42,6 +49,9 @@ type Server struct {
 	pool       *pool.Pool
 	cfg        config.Pool
 	cache      *cache.Cache
+	rewriter   *rewrite.Rewriter
+	firewall   *firewall.Firewall
+	throttle   *throttle.Limiter
 	log        *slog.Logger
 
 	srvConf *server.Server
@@ -81,6 +91,9 @@ func New(o Options) *Server {
 		pool:       o.Pool,
 		cfg:        o.PoolCfg,
 		cache:      o.Cache,
+		rewriter:   o.Rewriter,
+		firewall:   o.Firewall,
+		throttle:   o.Throttle,
 		log:        o.Log,
 		srvConf:    srvConf,
 		auth:       auth,

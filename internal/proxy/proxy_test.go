@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,8 +12,11 @@ import (
 
 	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
+	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/mysqltest"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
+	"github.com/ostap-mykhaylyak/gora/internal/throttle"
 )
 
 const (
@@ -32,15 +36,27 @@ func poolConfig() config.Pool {
 	}
 }
 
-// start runs a fake backend and a proxy in front of it, and returns both.
-func start(t *testing.T, listen config.Listen, poolCfg config.Pool) (*mysqltest.Server, *Server) {
-	return startWith(t, listen, poolCfg, nil, nil)
+// setup describes the assembly a test wants in front of the fake backend.
+// The zero value is a bare proxy: no cache, no traffic rules.
+type setup struct {
+	listen    config.Listen
+	pool      config.Pool
+	cache     *config.Cache
+	rules     []cache.Rule
+	rewrites  []rewrite.Rule
+	blocks    []firewall.Rule
+	throttles []throttle.Rule
 }
 
-// startWith adds a query cache to the assembly. A nil cacheCfg leaves the
-// proxy without one.
-func startWith(t *testing.T, listen config.Listen, poolCfg config.Pool, cacheCfg *config.Cache, rules []cache.Rule) (*mysqltest.Server, *Server) {
+// start runs a fake backend and a bare proxy in front of it.
+func start(t *testing.T, listen config.Listen, poolCfg config.Pool) (*mysqltest.Server, *Server) {
+	return startWith(t, setup{listen: listen, pool: poolCfg})
+}
+
+// startWith runs a fake backend and the proxy the setup describes.
+func startWith(t *testing.T, s setup) (*mysqltest.Server, *Server) {
 	t.Helper()
+	listen, poolCfg, cacheCfg, rules := s.listen, s.pool, s.cache, s.rules
 
 	backend := mysqltest.Start(t, backendUser, backendPass)
 	log := slog.New(slog.DiscardHandler)
@@ -64,16 +80,32 @@ func startWith(t *testing.T, listen config.Listen, poolCfg config.Pool, cacheCfg
 		}
 	}
 
+	rewriter, err := rewrite.New(s.rewrites, "wp_", log)
+	if err != nil {
+		t.Fatalf("rewrite.New: %v", err)
+	}
+	fw, err := firewall.New(s.blocks, "wp_")
+	if err != nil {
+		t.Fatalf("firewall.New: %v", err)
+	}
+	limiter, err := throttle.New(s.throttles, "wp_")
+	if err != nil {
+		t.Fatalf("throttle.New: %v", err)
+	}
+
 	if listen.Address == "" {
 		listen.Address = "127.0.0.1:0"
 	}
 	srv := New(Options{
-		Listen:  listen,
-		Users:   []config.User{{Username: clientUser, Password: clientPass}},
-		PoolCfg: poolCfg,
-		Pool:    p,
-		Cache:   queryCache,
-		Log:     log,
+		Listen:   listen,
+		Users:    []config.User{{Username: clientUser, Password: clientPass}},
+		PoolCfg:  poolCfg,
+		Pool:     p,
+		Cache:    queryCache,
+		Rewriter: rewriter,
+		Firewall: fw,
+		Throttle: limiter,
+		Log:      log,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -375,7 +407,7 @@ func cacheConfig() *config.Cache {
 // The point of the whole milestone, seen from the client: the second
 // pageload does not reach MySQL.
 func TestCachedReadDoesNotReachTheBackend(t *testing.T) {
-	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), nil)
+	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig()})
 	c := connect(t, srv)
 
 	for i := 0; i < 3; i++ {
@@ -391,7 +423,7 @@ func TestCachedReadDoesNotReachTheBackend(t *testing.T) {
 // Inside a transaction a read must see this session's own writes, so the
 // cache steps aside entirely.
 func TestReadsInsideATransactionBypassTheCache(t *testing.T) {
-	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), nil)
+	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig()})
 	c := connect(t, srv)
 
 	if _, err := c.Execute(allOptions); err != nil {
@@ -410,7 +442,7 @@ func TestReadsInsideATransactionBypassTheCache(t *testing.T) {
 
 // A write flowing through gora drops what it affects, for every session.
 func TestWriteInvalidatesForOtherSessions(t *testing.T) {
-	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), nil)
+	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig()})
 
 	reader := connect(t, srv)
 	if _, err := reader.Execute(allOptions); err != nil {
@@ -438,7 +470,7 @@ func TestPaginatedListingIsServedFromCache(t *testing.T) {
 		Match:        `(?i)^SELECT SQL_CALC_FOUND_ROWS`,
 		InvalidateOn: []string{"{prefix}posts"},
 	}}
-	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), rules)
+	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig(), rules: rules})
 
 	listing := "SELECT SQL_CALC_FOUND_ROWS ID FROM wp_posts WHERE post_type = 'product' LIMIT 0, 16"
 	for i := 0; i < 2; i++ {
@@ -456,6 +488,158 @@ func TestPaginatedListingIsServedFromCache(t *testing.T) {
 	}
 	if n := backend.Count("FOUND_ROWS()"); n != 1 {
 		t.Fatalf("the backend ran FOUND_ROWS() %d times, want 1", n)
+	}
+}
+
+// --- traffic rules ---
+
+// A rewrite must reach the backend, and the client must not notice.
+func TestRewrittenStatementReachesTheBackend(t *testing.T) {
+	backend, srv := startWith(t, setup{
+		pool: poolConfig(),
+		rewrites: []rewrite.Rule{{
+			Name:  "drop-order-by-rand",
+			Match: `(?i)\s*ORDER\s+BY\s+RAND\s*\(\s*\)`,
+		}},
+	})
+	c := connect(t, srv)
+
+	if _, err := c.Execute("SELECT ID FROM wp_posts ORDER BY RAND() LIMIT 5"); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if n := backend.Count("ORDER BY RAND"); n != 0 {
+		t.Fatalf("the backend still received ORDER BY RAND(): %q", backend.Queries())
+	}
+	if n := backend.Count("SELECT ID FROM wp_posts LIMIT 5"); n != 1 {
+		t.Fatalf("the backend did not receive the rewritten statement: %q", backend.Queries())
+	}
+}
+
+// A blocked statement never reaches the database, and the client is told
+// why in a way PHP will put in its error log.
+func TestBlockedStatementIsRefused(t *testing.T) {
+	backend, srv := startWith(t, setup{
+		pool: poolConfig(),
+		blocks: []firewall.Rule{{
+			Name:    "no-truncate",
+			Match:   "(?i)^TRUNCATE",
+			Message: "truncate is not allowed on this database",
+		}},
+	})
+	c := connect(t, srv)
+
+	_, err := c.Execute("TRUNCATE TABLE wp_postmeta")
+	if err == nil {
+		t.Fatal("a blocked statement succeeded")
+	}
+	if !strings.Contains(err.Error(), "truncate is not allowed") {
+		t.Fatalf("error %q does not carry the configured message", err)
+	}
+	if n := backend.Count("TRUNCATE"); n != 0 {
+		t.Fatalf("the blocked statement reached the backend: %q", backend.Queries())
+	}
+
+	// The session survives: the client can carry on.
+	if _, err := c.Execute("SELECT 1"); err != nil {
+		t.Fatalf("the session did not survive a blocked statement: %v", err)
+	}
+}
+
+// A dry-run rule reports what it would have refused, and refuses nothing.
+func TestDryRunBlockLetsTheStatementThrough(t *testing.T) {
+	backend, srv := startWith(t, setup{
+		pool: poolConfig(),
+		blocks: []firewall.Rule{{
+			Name:   "watch-truncate",
+			Match:  "(?i)^TRUNCATE",
+			DryRun: true,
+		}},
+	})
+	c := connect(t, srv)
+
+	if _, err := c.Execute("TRUNCATE TABLE wp_postmeta"); err != nil {
+		t.Fatalf("a dry-run rule blocked the statement: %v", err)
+	}
+	if n := backend.Count("TRUNCATE"); n != 1 {
+		t.Fatalf("the backend saw the statement %d times, want 1", n)
+	}
+}
+
+// Prepared statements must not be a way around the firewall.
+func TestBlockedStatementCannotBePrepared(t *testing.T) {
+	_, srv := startWith(t, setup{
+		pool:   poolConfig(),
+		blocks: []firewall.Rule{{Name: "no-truncate", Match: "(?i)^TRUNCATE"}},
+	})
+	c := connect(t, srv)
+
+	if _, err := c.Prepare("TRUNCATE TABLE wp_postmeta"); err == nil {
+		t.Fatal("a blocked statement was prepared")
+	}
+}
+
+// Past the limit the excess is refused rather than queued, and the client
+// gets an error naming the rule instead of a connection that hangs.
+func TestThrottleRefusesTheExcess(t *testing.T) {
+	backend, srv := startWith(t, setup{
+		pool: poolConfig(),
+		throttles: []throttle.Rule{{
+			Name:          "heavy-search",
+			Match:         "(?i)LIKE '%",
+			MaxConcurrent: 1,
+		}},
+	})
+	search := "SELECT ID FROM wp_posts WHERE post_title LIKE '%chair%'"
+	backend.Delay("LIKE", 300*time.Millisecond)
+
+	first := connect(t, srv)
+	second := connect(t, srv)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := first.Execute(search)
+		done <- err
+	}()
+
+	// Give the first statement time to take the only slot.
+	time.Sleep(100 * time.Millisecond)
+	if _, err := second.Execute(search); err == nil {
+		t.Fatal("a second concurrent execution was allowed past max_concurrent")
+	} else if !strings.Contains(err.Error(), "heavy-search") {
+		t.Fatalf("error %q does not name the throttle rule", err)
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("the first execution failed: %v", err)
+	}
+	if n := backend.Count("LIKE"); n != 1 {
+		t.Fatalf("the backend ran the statement %d times, want 1", n)
+	}
+
+	// Once the slot is free the same statement runs again.
+	if _, err := second.Execute(search); err != nil {
+		t.Fatalf("the statement was still refused after the slot freed up: %v", err)
+	}
+}
+
+// A cache hit costs the database nothing, so it must not need a slot
+// either.
+func TestThrottleDoesNotApplyToCacheHits(t *testing.T) {
+	_, srv := startWith(t, setup{
+		pool:  poolConfig(),
+		cache: cacheConfig(),
+		throttles: []throttle.Rule{{
+			Name:          "everything",
+			Match:         ".",
+			MaxConcurrent: 1,
+		}},
+	})
+	c := connect(t, srv)
+
+	for i := 0; i < 3; i++ {
+		if _, err := c.Execute(allOptions); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
 	}
 }
 

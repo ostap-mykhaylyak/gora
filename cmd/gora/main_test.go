@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/ostap-mykhaylyak/gora/internal/cache"
+	"github.com/ostap-mykhaylyak/gora/internal/confd"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 )
 
@@ -45,18 +46,21 @@ func TestWooCommerceProfileLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rules, err := cache.LoadRuleDir(dir)
+	rules, err := confd.Load(dir)
 	if err != nil {
 		t.Fatalf("the shipped WooCommerce profile does not load: %v", err)
 	}
-	if len(rules) == 0 {
-		t.Fatal("the shipped WooCommerce profile has no active rules")
+	if len(rules.Cache) == 0 {
+		t.Fatal("the shipped WooCommerce profile has no active cache rules")
 	}
 
 	cfg := config.Default().Cache
 	cfg.TablePrefix = "shop7_"
-	if _, err := cache.New(cfg, nil, rules, slog.New(slog.DiscardHandler)); err != nil {
+	if _, err := cache.New(cfg, nil, rules.Cache, slog.New(slog.DiscardHandler)); err != nil {
 		t.Fatalf("the profile does not compile against a custom prefix: %v", err)
+	}
+	if _, err := newTraffic(rules, "shop7_", slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("the profile's traffic rules do not compile: %v", err)
 	}
 }
 

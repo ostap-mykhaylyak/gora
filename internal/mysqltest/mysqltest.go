@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
@@ -31,6 +32,30 @@ type Server struct {
 
 	mu      sync.Mutex
 	queries []string
+	delays  map[string]time.Duration
+}
+
+// Delay makes every statement containing sub take at least d, so a test can
+// have two of them in flight at once.
+func (s *Server) Delay(sub string, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.delays == nil {
+		s.delays = make(map[string]time.Duration)
+	}
+	s.delays[strings.ToUpper(sub)] = d
+}
+
+// delayFor returns how long a statement should take.
+func (s *Server) delayFor(upper string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sub, d := range s.delays {
+		if strings.Contains(upper, sub) {
+			return d
+		}
+	}
+	return 0
 }
 
 // Start runs a fake backend accepting the given credentials, stopped
@@ -109,6 +134,9 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 	h.srv.mu.Unlock()
 
 	upper := strings.ToUpper(strings.TrimSpace(query))
+	if d := h.srv.delayFor(upper); d > 0 {
+		time.Sleep(d)
+	}
 	switch {
 	case strings.HasPrefix(upper, "KILL QUERY"):
 		h.srv.Kills.Add(1)

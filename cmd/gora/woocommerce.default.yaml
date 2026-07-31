@@ -67,3 +67,46 @@ rules:
   #   match: "(?i)^SELECT .* FROM {prefix}wc_product_meta_lookup"
   #   ttl: 2m
   #   invalidate_on: ["{prefix}wc_product_meta_lookup", "{prefix}postmeta", "{prefix}posts"]
+
+# Rewrites change what the database is asked, so none ship enabled. These
+# two are the ones worth knowing about; enable them only after checking that
+# the plugin producing the query survives the change.
+#
+# rewrites:
+#   # ORDER BY RAND() reads and sorts the whole table on every execution.
+#   # Removing it changes which rows come back, not how many.
+#   - name: drop-order-by-rand
+#     match: "(?i)\\s*ORDER\\s+BY\\s+RAND\\s*\\(\\s*\\)"
+#     replace: ""
+#
+#   # SQL_CALC_FOUND_ROWS is deprecated since MySQL 8.0.17 and costs a full
+#   # scan. Do NOT enable this on WooCommerce: the pagination reads
+#   # FOUND_ROWS() straight after, and would get the wrong total. The paired
+#   # cache above is the answer there. It is listed for the odd plugin that
+#   # asks for the count and never reads it.
+#   - name: drop-calc-found-rows
+#     match: "(?i)SQL_CALC_FOUND_ROWS\\s+"
+#     replace: ""
+
+# The emergency brake. A rule here refuses the statements it matches before
+# they reach the database: add one, reload, and a plugin taking the site
+# down stops taking it down. Try it with dry_run first, which logs what it
+# would have refused and refuses nothing.
+#
+# block:
+#   - name: no-truncate
+#     match: "(?i)^TRUNCATE"
+#     message: "TRUNCATE is not allowed through gora"
+#     dry_run: true
+
+# Throttling bounds how many copies of one statement run at once. It is the
+# brake for the query that is not wrong, only ruinous in quantity: the
+# excess waits, and past the wait it is refused, so the site stays slow
+# instead of going down. Limits apply per statement shape, so one runaway
+# query is held back without touching everything else the rule matches.
+#
+# throttle:
+#   - name: product-search
+#     match: "(?i)LIKE '%"
+#     max_concurrent: 2
+#     wait: 1s

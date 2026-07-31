@@ -137,6 +137,28 @@ type Breaker struct {
 // database instead of being told.
 const AutoPrefix = "auto"
 
+// PrefixPlaceholder is what a conf.d drop-in writes instead of the table
+// prefix, so the same file works on any installation.
+const PrefixPlaceholder = "{prefix}"
+
+// ExpandPrefix substitutes the table prefix into a drop-in expression.
+//
+// The cache discovers the prefix at runtime and rebinds its own rules when
+// it does; the traffic rules are compiled once at startup, so a placeholder
+// there needs a prefix that is known by then. Saying so is better than
+// silently matching the literal text "{prefix}postmeta", which would look
+// like a rule that simply never fires.
+func ExpandPrefix(expr, prefix string) (string, error) {
+	if !strings.Contains(expr, PrefixPlaceholder) {
+		return expr, nil
+	}
+	if prefix == AutoPrefix || prefix == "" {
+		return "", fmt.Errorf("%s needs a known table prefix: set cache.table_prefix instead of %q",
+			PrefixPlaceholder, AutoPrefix)
+	}
+	return strings.ReplaceAll(expr, PrefixPlaceholder, prefix), nil
+}
+
 // Cache controls the WordPress-aware query cache.
 type Cache struct {
 	Enabled bool `yaml:"enabled"`

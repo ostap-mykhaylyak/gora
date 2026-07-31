@@ -15,10 +15,14 @@ import (
 	"time"
 
 	"github.com/ostap-mykhaylyak/gora/internal/cache"
+	"github.com/ostap-mykhaylyak/gora/internal/confd"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
+	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
+	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/status"
+	"github.com/ostap-mykhaylyak/gora/internal/throttle"
 )
 
 // stopTimeout bounds how long `gora stop` waits for the process to go away
@@ -79,25 +83,33 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 	defer backendPool.Close()
 
 	rulesDir := rulesDirFor(cfg, configPath)
-	rules, err := cache.LoadRuleDir(rulesDir)
+	rules, err := confd.Load(rulesDir)
 	if err != nil {
 		return err
 	}
 
 	var queryCache *cache.Cache
 	if cfg.Cache.Enabled {
-		queryCache, err = cache.New(cfg.Cache, backendPool, rules, log)
+		queryCache, err = cache.New(cfg.Cache, backendPool, rules.Cache, log)
 		if err != nil {
 			return err
 		}
 		log.Info("query cache enabled",
-			"table_prefix", cfg.Cache.TablePrefix, "rules", len(rules), "rules_dir", rulesDir)
+			"table_prefix", cfg.Cache.TablePrefix, "rules", len(rules.Cache), "rules_dir", rulesDir)
 		if cfg.Cache.Warmup {
 			warmer := cache.NewWarmer(queryCache, backendPool, log)
 			go warmer.Run(ctx)
 			queryCache.SetRefetch(warmer.Trigger)
 		}
 	}
+
+	// The traffic rules always exist, possibly with nothing in them, so a
+	// reload can bring rules in without a restart.
+	traffic, err := newTraffic(rules, cfg.Cache.TablePrefix, log)
+	if err != nil {
+		return err
+	}
+	traffic.log(log, rulesDir)
 
 	listenTLS, err := clientTLS(cfg.Listen)
 	if err != nil {
@@ -108,13 +120,16 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 	}
 
 	srv := proxy.New(proxy.Options{
-		Listen:  cfg.Listen,
-		Users:   cfg.Users,
-		PoolCfg: cfg.Pool,
-		Pool:    backendPool,
-		Cache:   queryCache,
-		TLS:     listenTLS,
-		Log:     log,
+		Listen:   cfg.Listen,
+		Users:    cfg.Users,
+		PoolCfg:  cfg.Pool,
+		Pool:     backendPool,
+		Cache:    queryCache,
+		Rewriter: traffic.rewriter,
+		Firewall: traffic.firewall,
+		Throttle: traffic.throttle,
+		TLS:      listenTLS,
+		Log:      log,
 	})
 
 	if cfg.Status.Socket != "" {
@@ -128,6 +143,9 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 				Backend:       cfg.Backend.Address,
 				Clients:       srv.Stat(),
 				Pool:          backendPool.Stat(),
+				Firewall:      traffic.firewall.Stat(),
+				Throttle:      traffic.throttle.Stat(),
+				Rewrites:      traffic.rewriter.Len(),
 			}
 			if queryCache != nil {
 				rep := queryCache.ReportStats()
@@ -142,7 +160,7 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		}()
 	}
 
-	go watchReloads(ctx, configPath, rulesDir, queryCache, log)
+	go watchReloads(ctx, configPath, rulesDir, queryCache, traffic, log)
 
 	if err := srv.Run(ctx); err != nil {
 		return err
@@ -181,7 +199,7 @@ func rulesDirFor(cfg config.Config, configPath string) string {
 // pool and credentials are not swapped under running sessions. The rules
 // are the part meant to change while gora runs, which is what makes adding
 // one during an incident a `systemctl reload` away.
-func watchReloads(ctx context.Context, configPath, rulesDir string, queryCache *cache.Cache, log *slog.Logger) {
+func watchReloads(ctx context.Context, configPath, rulesDir string, queryCache *cache.Cache, tr *traffic, log *slog.Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -193,23 +211,31 @@ func watchReloads(ctx context.Context, configPath, rulesDir string, queryCache *
 		case <-hup:
 		}
 
-		if _, err := config.Load(configPath); err != nil {
+		cfg, err := config.Load(configPath)
+		if err != nil {
 			log.Error("reload failed, the running configuration is unchanged", "error", err)
 			continue
 		}
-		rules, err := cache.LoadRuleDir(rulesDir)
+		rules, err := confd.Load(rulesDir)
 		if err != nil {
 			log.Error("reload failed, keeping the previous rules", "error", err)
 			continue
 		}
+		// The traffic rules go first: they compile without touching the
+		// cache, so a bad expression is caught before anything is flushed.
+		if err := tr.setRules(rules, cfg.Cache.TablePrefix); err != nil {
+			log.Error("reload failed, keeping the previous rules", "error", err)
+			continue
+		}
 		if queryCache != nil {
-			if err := queryCache.SetRules(rules); err != nil {
+			if err := queryCache.SetRules(rules.Cache); err != nil {
 				log.Error("reload failed, keeping the previous rules", "error", err)
 				continue
 			}
 		}
-		log.Info("configuration reloaded", "config", configPath,
-			"rules", len(rules), "rules_dir", rulesDir)
+		log.Info("configuration reloaded", "config", configPath, "rules_dir", rulesDir,
+			"cache_rules", len(rules.Cache), "rewrites", len(rules.Rewrites),
+			"blocks", len(rules.Blocks), "throttles", len(rules.Throttles))
 	}
 }
 
@@ -297,6 +323,21 @@ func printStatus(configPath string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, "          no client ever waited for a connection")
 	}
 
+	// Traffic rules are only worth a line when they exist, but once they do,
+	// what they have actually done is the thing you came to find out.
+	if snap.Firewall.Rules > 0 || snap.Throttle.Rules > 0 || snap.Rewrites > 0 {
+		fmt.Fprintf(stdout, "traffic:  %d rewrite, %d block, %d throttle rule(s)\n",
+			snap.Rewrites, snap.Firewall.Rules, snap.Throttle.Rules)
+		if snap.Firewall.Rules > 0 {
+			fmt.Fprintf(stdout, "          %d statements refused, %d dry-run matches\n",
+				snap.Firewall.Blocked, snap.Firewall.DryRunMatches)
+		}
+		if snap.Throttle.Rules > 0 {
+			fmt.Fprintf(stdout, "          %d statements waited for a slot, %d refused\n",
+				snap.Throttle.Waits, snap.Throttle.Rejects)
+		}
+	}
+
 	if c := snap.Cache; c != nil {
 		total := c.Hits + c.Misses
 		ratio := 0.0
@@ -350,26 +391,56 @@ func checkConfig(configPath string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "  status:   %s\n", socket)
 	fmt.Fprintf(stdout, "  log:      %s, level %s, format %s\n", cfg.Log.Path, cfg.Log.Level, cfg.Log.Format)
 
-	// The conf.d drop-ins are the part most likely to be wrong, and the part
-	// a reload applies, so validating them is most of the value here.
-	if !cfg.Cache.Enabled {
+	if cfg.Cache.Enabled {
+		prefix := cfg.Cache.TablePrefix
+		if prefix == config.AutoPrefix {
+			prefix = "auto (detected from the database)"
+		}
+		fmt.Fprintf(stdout, "  cache:    enabled, prefix %s\n", prefix)
+	} else {
 		fmt.Fprintln(stdout, "  cache:    disabled")
-		return nil
 	}
+
+	// The conf.d drop-ins are the part most likely to be wrong, and the part
+	// a reload applies, so validating them is most of the value here. They
+	// are compiled, not merely parsed: a rule using {prefix} with an
+	// automatic table prefix has to be caught now, not at the next reload.
 	rulesDir := rulesDirFor(cfg, configPath)
-	rules, err := cache.LoadRuleDir(rulesDir)
+	rules, err := confd.Load(rulesDir)
 	if err != nil {
 		return err
 	}
-	prefix := cfg.Cache.TablePrefix
-	if prefix == config.AutoPrefix {
-		prefix = "auto (detected from the database)"
+	if _, err := newTraffic(rules, cfg.Cache.TablePrefix, slog.New(slog.DiscardHandler)); err != nil {
+		return err
 	}
-	fmt.Fprintf(stdout, "  cache:    prefix %s, %d rule(s) from %s\n", prefix, len(rules), rulesDir)
-	for _, r := range rules {
-		fmt.Fprintf(stdout, "              - %s\n", r.Name)
-	}
+
+	fmt.Fprintf(stdout, "  conf.d:   %d rule(s) from %s\n", rules.Len(), rulesDir)
+	listRules(stdout, "cache", ruleNames(rules.Cache, func(r cache.Rule) string { return r.Name }))
+	listRules(stdout, "rewrite", ruleNames(rules.Rewrites, func(r rewrite.Rule) string { return r.Name }))
+	listRules(stdout, "block", ruleNames(rules.Blocks, func(r firewall.Rule) string {
+		if r.DryRun {
+			return r.Name + " (dry run)"
+		}
+		return r.Name
+	}))
+	listRules(stdout, "throttle", ruleNames(rules.Throttles, func(r throttle.Rule) string {
+		return fmt.Sprintf("%s (max %d concurrent)", r.Name, r.MaxConcurrent)
+	}))
 	return nil
+}
+
+func ruleNames[T any](rules []T, name func(T) string) []string {
+	out := make([]string, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, name(r))
+	}
+	return out
+}
+
+func listRules(stdout io.Writer, section string, names []string) {
+	for _, n := range names {
+		fmt.Fprintf(stdout, "              %-9s %s\n", section, n)
+	}
 }
 
 // --- pid file ---

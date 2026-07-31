@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -13,8 +14,11 @@ import (
 
 	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
+	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/statement"
+	"github.com/ostap-mykhaylyak/gora/internal/throttle"
 )
 
 // maxTrackedSets caps the SET statements replayed on connection reuse.
@@ -42,12 +46,15 @@ const maxTrackedTxWrites = 128
 // come back as "server has gone away". If the connection is lost anyway,
 // the next command transparently attaches a fresh one.
 type session struct {
-	ctx   context.Context
-	srv   *Server
-	pool  *pool.Pool
-	cfg   config.Pool
-	cache *cache.Cache // nil when the cache is disabled
-	log   *slog.Logger
+	ctx      context.Context
+	srv      *Server
+	pool     *pool.Pool
+	cfg      config.Pool
+	cache    *cache.Cache // nil when the cache is disabled
+	rewriter *rewrite.Rewriter
+	firewall *firewall.Firewall
+	throttle *throttle.Limiter
+	log      *slog.Logger
 
 	mu      sync.Mutex // guards everything below, including against the pinger
 	conn    *pool.Conn
@@ -89,6 +96,9 @@ func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 		pool:     srv.pool,
 		cfg:      srv.cfg,
 		cache:    srv.cache,
+		rewriter: srv.rewriter,
+		firewall: srv.firewall,
+		throttle: srv.throttle,
 		log:      log,
 		mux:      srv.cfg.Multiplexing,
 		lastUse:  time.Now(),
@@ -394,6 +404,19 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Rewrites come first: everything downstream — the firewall, the cache
+	// key, the backend — must see the statement as it will actually run.
+	if s.rewriter != nil {
+		if rewritten, applied := s.rewriter.Apply(query); len(applied) > 0 {
+			s.log.Debug("statement rewritten",
+				"rules", strings.Join(applied, ","), "query", rewritten)
+			query = rewritten
+		}
+	}
+	if err := s.checkFirewall(query); err != nil {
+		return nil, err
+	}
+
 	// Paginated listings: SQL_CALC_FOUND_ROWS and the FOUND_ROWS() that
 	// follows are cached as one thing. Only outside transactions, where
 	// reads have to see the session's own writes.
@@ -411,6 +434,15 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 
 	kind := statement.Classify(query)
 	exec := func() (*mysql.Result, error) {
+		// Throttling happens here rather than at the top of the handler:
+		// it protects the database, and a statement answered from memory
+		// never reaches it.
+		release, err := s.acquireSlot(query)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+
 		c, err := s.backend()
 		if err != nil {
 			return nil, err
@@ -451,6 +483,41 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	return r, nil
 }
 
+// checkFirewall refuses a statement a rule says must not run. A dry-run
+// match is logged and let through, which is how a rule is tried against
+// production traffic before it refuses anything.
+func (s *session) checkFirewall(query string) error {
+	if s.firewall == nil {
+		return nil
+	}
+	verdict, matched := s.firewall.Check(query)
+	if !matched {
+		return nil
+	}
+	if !verdict.Blocked {
+		s.log.Warn("firewall rule matched (dry run, statement allowed)",
+			"rule", verdict.Rule, "query", query)
+		return nil
+	}
+	s.log.Warn("statement refused by the firewall", "rule", verdict.Rule, "query", query)
+	return mysql.NewError(mysql.ER_UNKNOWN_ERROR, verdict.Message)
+}
+
+// acquireSlot applies the throttle rules. The returned function releases
+// the slot and is always safe to call.
+func (s *session) acquireSlot(query string) (func(), error) {
+	if s.throttle == nil {
+		return func() {}, nil
+	}
+	release, rule, err := s.throttle.Acquire(query)
+	if err != nil {
+		s.log.Warn("statement throttled", "rule", rule, "query", query)
+		return nil, mysql.NewError(mysql.ER_UNKNOWN_ERROR,
+			fmt.Sprintf("gora: %s (throttle rule %q)", err, rule))
+	}
+	return release, nil
+}
+
 // handleListing serves or caches a SQL_CALC_FOUND_ROWS listing, keeping its
 // rows and its total together. Must be called with s.mu held.
 func (s *session) handleListing(query string) (*mysql.Result, error) {
@@ -464,6 +531,12 @@ func (s *session) handleListing(query string) (*mysql.Result, error) {
 		s.maybeRelease()
 		return r, nil
 	}
+
+	release, err := s.acquireSlot(query)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	c, err := s.backend()
 	if err != nil {
@@ -595,6 +668,13 @@ func (s *session) HandleStmtPrepare(query string) (int, int, any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Prepared statements are never rewritten — the text is a contract with
+	// the client, which holds a handle to it — but the firewall still has a
+	// say, or a blocked statement would come back through the front door.
+	if err := s.checkFirewall(query); err != nil {
+		return 0, 0, nil, err
+	}
+
 	c, err := s.backend()
 	if err != nil {
 		return 0, 0, nil, err
@@ -619,6 +699,12 @@ func (s *session) HandleStmtExecute(context any, query string, args []any) (*mys
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	release, err := s.acquireSlot(query)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	stopWatchdog := func() {}
 	if s.conn != nil {
