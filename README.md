@@ -6,9 +6,10 @@ and configured with a single `config.yaml`.
 A *gora* is the channel that carries water to a mill: the queries are the
 water, MySQL is the mill.
 
-> ⚠️ **Early development.** gora proxies traffic, pools connections and
-> multiplexes them. The query cache, the traffic rules, the profiler and the
-> replication manager are still to come — see the roadmap.
+> ⚠️ **Early development.** gora proxies traffic, pools connections,
+> multiplexes them and caches WordPress's hottest reads. The traffic rules,
+> the profiler and the replication manager are still to come — see the
+> roadmap.
 
 ## Features
 
@@ -37,6 +38,35 @@ water, MySQL is the mill.
   MySQL. With a `users` list the database password never leaves gora and
   never appears in `wp-config.php`; a failed login costs no backend
   connection at all.
+- **WordPress-aware query cache** — the autoloaded options query (the
+  hottest query of every pageload) and transient reads are served from RAM.
+  Invalidation is write-driven: every write flowing through gora drops
+  exactly the entries it can affect — per option name on the options table,
+  per table elsewhere — with a TTL as a safety net. Reads inside a
+  transaction always bypass the cache, and a write gora cannot parse flushes
+  everything: in doubt it prefers a database roundtrip to a stale answer.
+- **Stampede protection** — when many workers ask for the same cacheable
+  query at once, one of them asks the database and the others wait for that
+  answer. A cold cache under load is exactly when the database can least
+  afford a hundred copies of the same query.
+- **Rule-based caching for WooCommerce** — drop-ins in `/etc/gora/conf.d/`
+  add rules as regex + TTL + invalidation tables, and `--init` installs a
+  WooCommerce profile. `{prefix}` expands to the table prefix, which gora
+  discovers from the database on its own unless you name it. Carts, customer
+  sessions and orders — legacy or High-Performance Order Storage — are
+  deliberately never cached.
+- **Paginated listings** — a shop listing runs `SQL_CALC_FOUND_ROWS` and
+  then asks for the total with `FOUND_ROWS()`, which reads a counter living
+  on the connection. gora caches the rows and the total together and replays
+  both, and refuses to serve rows whose total it has not captured yet:
+  wrong pagination on a shop that looks healthy is worse than a cache miss.
+- **Cache warm-up** — an option write invalidates the autoloaded snapshot;
+  with `cache.warmup` gora refetches it in the background straight away, so
+  the next visitor never pays for it.
+- **Hot reload** — `systemctl reload gora` (SIGHUP) applies the conf.d
+  drop-ins without dropping a single client connection, so adding a rule
+  during an incident does not mean a restart. A drop-in that no longer
+  parses is reported and the previous rules stay in force.
 - **Circuit breaker** — when MySQL is down, waiting for per-request timeouts
   melts PHP-FPM. After `pool.breaker.failures` consecutive failures gora
   fails fast with a clean error and probes the backend until it recovers.
@@ -130,6 +160,17 @@ pool:
     failures: 3
     probe_interval: 2s
 
+cache:
+  enabled: true
+  table_prefix: auto         # or "wp_"
+  autoload_options: true
+  transients: true
+  default_ttl: 5m
+  max_entries: 10000
+  max_bytes: 268435456
+  max_result_bytes: 1048576
+  warmup: true
+
 status:
   socket: /run/gora/status.sock   # read-only, feeds `gora status`
 
@@ -152,6 +193,29 @@ users:
 Unknown keys are an error, not a warning: a typo must never leave a default
 silently in place.
 
+### Cache rules (conf.d)
+
+Every `*.yaml` file in `/etc/gora/conf.d/` adds rules. A rule caches the
+SELECTs matching an RE2 expression and drops them when a write touches one
+of its `invalidate_on` tables:
+
+```yaml
+name: my-rules
+rules:
+  - name: attribute-taxonomies
+    match: "(?i)^SELECT \\* FROM {prefix}woocommerce_attribute_taxonomies"
+    ttl: 30m
+    invalidate_on: ["{prefix}woocommerce_attribute_taxonomies"]
+```
+
+`invalidate_on` is required: a rule without it serves stale rows until its
+TTL expires, which is never what the author meant. Apply changes with
+`systemctl reload gora`, and check them first with `gora --check-config`,
+which loads the drop-ins and lists the rules it found.
+
+Only add rules for queries whose answer is the same for every visitor. Never
+cache per-customer data — carts, sessions, orders.
+
 ## Current limitations
 
 - Result sets are buffered in memory while being relayed; a full-table dump
@@ -166,8 +230,8 @@ silently in place.
 | | Milestone | Contents |
 |---|---|---|
 | ~~M0~~ | skeleton | CLI, configuration, logging, service control, `--init`, status socket, CI |
-| **M1** | data plane | MySQL protocol, connection pool, keepalive, per-query multiplexing, TLS |
-| M2 | cache | WordPress-aware query cache, conf.d rules, hot reload, warm-up |
+| ~~M1~~ | data plane | MySQL protocol, connection pool, keepalive, per-query multiplexing, TLS |
+| **M2** | cache | WordPress-aware query cache, conf.d rules, hot reload, warm-up |
 | M3 | traffic | query rewriting, firewall, per-digest throttling |
 | M4 | profiling | slow query log, aggregated report, index and rewrite advisor |
 | M5 | topology | multiple nodes, health checks, read/write split, degraded mode |

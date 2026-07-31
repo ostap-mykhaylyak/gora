@@ -9,6 +9,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/mysqltest"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
@@ -33,6 +34,12 @@ func poolConfig() config.Pool {
 
 // start runs a fake backend and a proxy in front of it, and returns both.
 func start(t *testing.T, listen config.Listen, poolCfg config.Pool) (*mysqltest.Server, *Server) {
+	return startWith(t, listen, poolCfg, nil, nil)
+}
+
+// startWith adds a query cache to the assembly. A nil cacheCfg leaves the
+// proxy without one.
+func startWith(t *testing.T, listen config.Listen, poolCfg config.Pool, cacheCfg *config.Cache, rules []cache.Rule) (*mysqltest.Server, *Server) {
 	t.Helper()
 
 	backend := mysqltest.Start(t, backendUser, backendPass)
@@ -49,6 +56,14 @@ func start(t *testing.T, listen config.Listen, poolCfg config.Pool) (*mysqltest.
 	}
 	t.Cleanup(p.Close)
 
+	var queryCache *cache.Cache
+	if cacheCfg != nil {
+		queryCache, err = cache.New(*cacheCfg, p, rules, log)
+		if err != nil {
+			t.Fatalf("cache.New: %v", err)
+		}
+	}
+
 	if listen.Address == "" {
 		listen.Address = "127.0.0.1:0"
 	}
@@ -57,6 +72,7 @@ func start(t *testing.T, listen config.Listen, poolCfg config.Pool) (*mysqltest.
 		Users:   []config.User{{Username: clientUser, Password: clientPass}},
 		PoolCfg: poolCfg,
 		Pool:    p,
+		Cache:   queryCache,
 		Log:     log,
 	})
 
@@ -337,6 +353,110 @@ func asMyError(err error, target **mysql.MyError) bool {
 		*target = e
 	}
 	return ok
+}
+
+// --- query cache ---
+
+const allOptions = "SELECT option_name, option_value FROM wp_options WHERE autoload = 'yes'"
+
+func cacheConfig() *config.Cache {
+	return &config.Cache{
+		Enabled:         true,
+		TablePrefix:     "wp_",
+		AutoloadOptions: true,
+		Transients:      true,
+		DefaultTTL:      config.Duration(time.Minute),
+		MaxEntries:      100,
+		MaxBytes:        1 << 20,
+		MaxResultBytes:  1 << 20,
+	}
+}
+
+// The point of the whole milestone, seen from the client: the second
+// pageload does not reach MySQL.
+func TestCachedReadDoesNotReachTheBackend(t *testing.T) {
+	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), nil)
+	c := connect(t, srv)
+
+	for i := 0; i < 3; i++ {
+		if _, err := c.Execute(allOptions); err != nil {
+			t.Fatalf("Execute: %v", err)
+		}
+	}
+	if n := backend.Count("WHERE autoload"); n != 1 {
+		t.Fatalf("the backend saw the autoloaded options query %d times, want 1", n)
+	}
+}
+
+// Inside a transaction a read must see this session's own writes, so the
+// cache steps aside entirely.
+func TestReadsInsideATransactionBypassTheCache(t *testing.T) {
+	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), nil)
+	c := connect(t, srv)
+
+	if _, err := c.Execute(allOptions); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if _, err := c.Execute("BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if _, err := c.Execute(allOptions); err != nil {
+		t.Fatalf("Execute in transaction: %v", err)
+	}
+	if n := backend.Count("WHERE autoload"); n != 2 {
+		t.Fatalf("the backend saw the query %d times, want 2: the transaction was served from cache", n)
+	}
+}
+
+// A write flowing through gora drops what it affects, for every session.
+func TestWriteInvalidatesForOtherSessions(t *testing.T) {
+	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), nil)
+
+	reader := connect(t, srv)
+	if _, err := reader.Execute(allOptions); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	writer := connect(t, srv)
+	if _, err := writer.Execute("UPDATE wp_options SET option_value = 'x' WHERE option_name = 'siteurl'"); err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+
+	if _, err := reader.Execute(allOptions); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if n := backend.Count("WHERE autoload"); n != 2 {
+		t.Fatalf("the backend saw the query %d times, want 2: a stale snapshot was served", n)
+	}
+}
+
+// A listing and its total are cached together, so the second visitor gets
+// both from memory and the pagination still adds up.
+func TestPaginatedListingIsServedFromCache(t *testing.T) {
+	rules := []cache.Rule{{
+		Name:         "product-listing",
+		Match:        `(?i)^SELECT SQL_CALC_FOUND_ROWS`,
+		InvalidateOn: []string{"{prefix}posts"},
+	}}
+	backend, srv := startWith(t, config.Listen{}, poolConfig(), cacheConfig(), rules)
+
+	listing := "SELECT SQL_CALC_FOUND_ROWS ID FROM wp_posts WHERE post_type = 'product' LIMIT 0, 16"
+	for i := 0; i < 2; i++ {
+		c := connect(t, srv)
+		if _, err := c.Execute(listing); err != nil {
+			t.Fatalf("listing: %v", err)
+		}
+		if _, err := c.Execute("SELECT FOUND_ROWS()"); err != nil {
+			t.Fatalf("FOUND_ROWS(): %v", err)
+		}
+	}
+
+	if n := backend.Count("SQL_CALC_FOUND_ROWS"); n != 1 {
+		t.Fatalf("the backend ran the listing %d times, want 1", n)
+	}
+	if n := backend.Count("FOUND_ROWS()"); n != 1 {
+		t.Fatalf("the backend ran FOUND_ROWS() %d times, want 1", n)
+	}
 }
 
 func waitFor(t *testing.T, limit time.Duration, cond func() bool) {

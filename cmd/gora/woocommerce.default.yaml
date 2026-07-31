@@ -1,0 +1,69 @@
+# WooCommerce cache profile, installed by `gora --init`.
+#
+# Every rule caches SELECTs matching a regular expression and drops them when
+# a write touches one of the invalidate_on tables. {prefix} expands to the
+# WordPress table prefix, so these work on any installation.
+#
+# Only add rules for queries whose answer is the same for every visitor.
+# Deliberately absent, and not to be added:
+#
+#   - carts and customer sessions ({prefix}woocommerce_sessions)
+#   - orders, in both storage layouts: the legacy posts/postmeta one and
+#     High-Performance Order Storage ({prefix}wc_orders,
+#     {prefix}wc_order_addresses, {prefix}wc_orders_meta)
+#   - customer lookup tables ({prefix}wc_customer_lookup)
+#
+# Those are per-customer data. Serving one shopper's rows to another is the
+# one failure a cache must never have, and no hit rate is worth it.
+#
+# Reload after editing: systemctl reload gora
+
+name: woocommerce
+
+rules:
+  # Product metadata, fetched in batches for every product on a page. The
+  # heaviest repeated query of a shop after the autoloaded options.
+  - name: product-meta
+    match: "(?i)^SELECT post_id, meta_key, meta_value FROM {prefix}postmeta WHERE post_id IN"
+    ttl: 5m
+    invalidate_on: ["{prefix}postmeta"]
+
+  # The attribute taxonomies (colour, size...). Read on nearly every shop
+  # page, written only when someone edits them in the admin.
+  - name: attribute-taxonomies
+    match: "(?i)^SELECT \\* FROM {prefix}woocommerce_attribute_taxonomies"
+    ttl: 30m
+    invalidate_on: ["{prefix}woocommerce_attribute_taxonomies"]
+
+  # Category and shop listings. WordPress asks for a page of products with
+  # SQL_CALC_FOUND_ROWS and then for the total with FOUND_ROWS(): gora caches
+  # the two together, so the pagination stays correct.
+  #
+  # Enabled because a catalogue page looks the same to every visitor. If a
+  # plugin personalises the product list (per-customer pricing or visibility),
+  # comment this rule out.
+  - name: product-listing
+    match: "(?i)^SELECT SQL_CALC_FOUND_ROWS .*FROM {prefix}posts.*post_type = 'product'"
+    ttl: 2m
+    invalidate_on:
+      - "{prefix}posts"
+      - "{prefix}postmeta"
+      - "{prefix}term_relationships"
+      - "{prefix}wc_product_meta_lookup"
+
+  # Term lookups behind category menus and filters. The exact shape of these
+  # queries changes between WordPress versions, so check yours in the slow
+  # query log before enabling this one.
+  # - name: term-lookup
+  #   match: "(?i)^SELECT t\\.\\*, tt\\.\\* FROM {prefix}terms AS t INNER JOIN {prefix}term_taxonomy AS tt"
+  #   ttl: 10m
+  #   invalidate_on: ["{prefix}terms", "{prefix}term_taxonomy", "{prefix}term_relationships"]
+
+  # The product lookup table WooCommerce keeps for sorting and filtering.
+  # Left off by default because these queries are often subqueries joined to
+  # other tables, and a rule that matches one of those would need those
+  # tables in invalidate_on too.
+  # - name: product-lookup
+  #   match: "(?i)^SELECT .* FROM {prefix}wc_product_meta_lookup"
+  #   ttl: 2m
+  #   invalidate_on: ["{prefix}wc_product_meta_lookup", "{prefix}postmeta", "{prefix}posts"]

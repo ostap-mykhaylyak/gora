@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
 )
@@ -31,8 +32,9 @@ type Snapshot struct {
 	Listen        string `json:"listen"`
 	Backend       string `json:"backend"`
 
-	Clients proxy.Stats `json:"clients"`
-	Pool    pool.Stats  `json:"pool"`
+	Clients proxy.Stats   `json:"clients"`
+	Pool    pool.Stats    `json:"pool"`
+	Cache   *cache.Report `json:"cache,omitempty"`
 }
 
 // Uptime returns the uptime as a duration.

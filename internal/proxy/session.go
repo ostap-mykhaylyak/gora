@@ -11,6 +11,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/statement"
@@ -20,6 +21,11 @@ import (
 // A session that sets more than this is doing something gora should not try
 // to reproduce, so it gets pinned instead.
 const maxTrackedSets = 20
+
+// maxTrackedTxWrites caps the writes remembered inside one transaction for
+// re-invalidation at COMMIT. Past it the whole cache is flushed instead:
+// remembering an unbounded list would turn a bulk import into a memory leak.
+const maxTrackedTxWrites = 128
 
 // session implements server.Handler for one client connection.
 //
@@ -36,11 +42,12 @@ const maxTrackedSets = 20
 // come back as "server has gone away". If the connection is lost anyway,
 // the next command transparently attaches a fresh one.
 type session struct {
-	ctx  context.Context
-	srv  *Server
-	pool *pool.Pool
-	cfg  config.Pool
-	log  *slog.Logger
+	ctx   context.Context
+	srv   *Server
+	pool  *pool.Pool
+	cfg   config.Pool
+	cache *cache.Cache // nil when the cache is disabled
+	log   *slog.Logger
 
 	mu      sync.Mutex // guards everything below, including against the pinger
 	conn    *pool.Conn
@@ -61,6 +68,16 @@ type session struct {
 	setStmts  []string // tracked SETs, replayed on connection reuse
 	varSig    string   // signature of setStmts
 
+	// Cache state.
+	txWrites    []string // writes seen inside the open transaction
+	txOverflow  bool
+	cacheUnsafe bool // the session did something the cache cannot follow
+
+	// Pairing state for SQL_CALC_FOUND_ROWS listings.
+	calcPending    string // listing executed on the backend, awaiting its count
+	foundRows      uint64 // count to serve for the next FOUND_ROWS()
+	foundRowsKnown bool   // whether foundRows is armed
+
 	stopPing chan struct{}
 	pingDone chan struct{}
 }
@@ -71,6 +88,7 @@ func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 		srv:      srv,
 		pool:     srv.pool,
 		cfg:      srv.cfg,
+		cache:    srv.cache,
 		log:      log,
 		mux:      srv.cfg.Multiplexing,
 		lastUse:  time.Now(),
@@ -376,11 +394,81 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Paginated listings: SQL_CALC_FOUND_ROWS and the FOUND_ROWS() that
+	// follows are cached as one thing. Only outside transactions, where
+	// reads have to see the session's own writes.
+	if s.cacheActive() && !s.inTx {
+		if cache.IsFoundRowsQuery(query) {
+			return s.serveFoundRows(query)
+		}
+		if cache.HasCalcFoundRows(query) && s.cache.PairedCacheable(s.db, query) {
+			return s.handleListing(query)
+		}
+	}
+	// Anything else breaks a pending listing/count sequence.
+	s.calcPending = ""
+	s.foundRowsKnown = false
+
+	kind := statement.Classify(query)
+	exec := func() (*mysql.Result, error) {
+		c, err := s.backend()
+		if err != nil {
+			return nil, err
+		}
+		stopWatchdog := s.queryWatchdog(c, query)
+		r, err := c.Execute(query)
+		stopWatchdog()
+		s.finish(err)
+		return r, err
+	}
+
+	var (
+		r        *mysql.Result
+		err      error
+		executed = true
+	)
+	// Inside a transaction the cache is bypassed entirely: a read must see
+	// what this session has just written, and nothing else may see it.
+	if s.cacheActive() && kind == statement.KindSelect && !s.inTx {
+		var outcome cache.Outcome
+		r, outcome, err = s.cache.Get(s.db, query, exec)
+		executed = outcome == cache.OutcomeExecuted
+	} else {
+		r, err = exec()
+	}
+	if err != nil {
+		return r, err
+	}
+
+	if executed {
+		s.trackSet(query, classifySet(query))
+		s.trackSafety(kind, query, r)
+		if s.cacheActive() {
+			s.observe(kind, query)
+		}
+	}
+	s.maybeRelease()
+	return r, nil
+}
+
+// handleListing serves or caches a SQL_CALC_FOUND_ROWS listing, keeping its
+// rows and its total together. Must be called with s.mu held.
+func (s *session) handleListing(query string) (*mysql.Result, error) {
+	if r, foundRows, ok := s.cache.LookupPaired(s.db, query); ok {
+		// Rows from memory: arm the answer to the FOUND_ROWS() that is
+		// about to arrive, so pagination stays right without a roundtrip.
+		s.foundRows = foundRows
+		s.foundRowsKnown = true
+		s.calcPending = ""
+		s.lastUse = time.Now()
+		s.maybeRelease()
+		return r, nil
+	}
+
 	c, err := s.backend()
 	if err != nil {
 		return nil, err
 	}
-
 	stopWatchdog := s.queryWatchdog(c, query)
 	r, err := c.Execute(query)
 	stopWatchdog()
@@ -389,10 +477,94 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		return r, err
 	}
 
-	s.trackSet(query, classifySet(query))
-	s.trackSafety(statement.Classify(query), query, r)
-	s.maybeRelease()
+	s.cache.StorePaired(s.db, query, r)
+	// The next FOUND_ROWS() belongs to this statement and reads a counter
+	// living on this connection: it is not released here.
+	s.calcPending = query
+	s.foundRowsKnown = false
 	return r, nil
+}
+
+// serveFoundRows answers SELECT FOUND_ROWS(): from the pairing cache when
+// the listing before it was a hit, otherwise from the backend, in which
+// case the count completes the entry stored a moment ago.
+// Must be called with s.mu held.
+func (s *session) serveFoundRows(query string) (*mysql.Result, error) {
+	if s.foundRowsKnown {
+		r := cache.FoundRowsResult(s.foundRows)
+		s.foundRowsKnown = false
+		s.calcPending = ""
+		s.lastUse = time.Now()
+		s.maybeRelease()
+		return r, nil
+	}
+
+	c, err := s.backend()
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.Execute(query)
+	s.finish(err)
+	if err == nil && s.calcPending != "" && r != nil && r.Resultset != nil && len(r.Values) > 0 {
+		if n, e := r.GetUint(0, 0); e == nil {
+			s.cache.PairFoundRows(s.db, s.calcPending, n)
+		}
+	}
+	s.calcPending = ""
+	s.maybeRelease()
+	return r, err
+}
+
+// cacheActive reports whether this session may use the cache.
+// Must be called with s.mu held.
+func (s *session) cacheActive() bool {
+	return s.cache != nil && !s.cacheUnsafe
+}
+
+// observe keeps the cache in step with what the session just did.
+// Must be called with s.mu held.
+func (s *session) observe(kind statement.Kind, query string) {
+	switch kind {
+	case statement.KindWrite:
+		// Invalidate straight away so other sessions stop reading entries
+		// that are about to be wrong. Inside a transaction the write is
+		// also remembered and replayed at COMMIT, because in the meantime
+		// another session may have repopulated those entries with data
+		// that predates the commit.
+		s.cache.InvalidateWrite(s.db, query)
+		if s.inTx {
+			if len(s.txWrites) >= maxTrackedTxWrites {
+				s.txOverflow = true
+			} else {
+				s.txWrites = append(s.txWrites, query)
+			}
+		}
+	case statement.KindCommit:
+		s.endTx(true)
+	case statement.KindRollback:
+		s.endTx(false)
+	case statement.KindUnsafe:
+		s.log.Debug("cache disabled for this session", "query", query)
+		s.cacheUnsafe = true
+	case statement.KindSelect, statement.KindBegin, statement.KindOther:
+		// Nothing to invalidate.
+	}
+}
+
+// endTx closes the transaction bookkeeping; on commit the writes it
+// recorded are invalidated a second time. Must be called with s.mu held.
+func (s *session) endTx(commit bool) {
+	if commit {
+		if s.txOverflow {
+			s.cache.Flush("a transaction with too many writes was committed")
+		} else {
+			for _, q := range s.txWrites {
+				s.cache.InvalidateWrite(s.db, q)
+			}
+		}
+	}
+	s.txWrites = nil
+	s.txOverflow = false
 }
 
 // HandleFieldList handles COM_FIELD_LIST, which only old clients send.
@@ -456,7 +628,14 @@ func (s *session) HandleStmtExecute(context any, query string, args []any) (*mys
 	stopWatchdog()
 	s.finish(err)
 	if err == nil {
-		s.trackSafety(statement.Classify(query), query, r)
+		kind := statement.Classify(query)
+		s.trackSafety(kind, query, r)
+		if s.cacheActive() && kind != statement.KindSelect {
+			// Prepared reads are never served from the cache — the
+			// parameters are not part of the statement text — but prepared
+			// writes still have to invalidate what they touch.
+			s.observe(kind, query)
+		}
 	}
 	return r, err
 }
@@ -525,6 +704,11 @@ func (s *session) resetState() {
 	s.openStmts = 0
 	s.setStmts = nil
 	s.varSig = ""
+	s.txWrites = nil
+	s.txOverflow = false
+	s.cacheUnsafe = false
+	s.calcPending = ""
+	s.foundRowsKnown = false
 	if s.pinned {
 		s.srv.numPinned.Add(-1)
 		s.pinned = false

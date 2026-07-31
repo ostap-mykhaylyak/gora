@@ -75,6 +75,33 @@ pool:
     failures: 3
     probe_interval: 2s
 
+cache:
+  # WordPress-aware query cache with write-driven invalidation.
+  enabled: true
+  # WordPress's $table_prefix, or "auto" to discover it from the database.
+  # Set it explicitly when several installations with different prefixes
+  # share one gora.
+  table_prefix: auto
+  # Cache the autoloaded options query, the hottest query of every pageload,
+  # invalidated by writes on the options table.
+  autoload_options: true
+  # Cache transient reads, invalidated per option name on writes.
+  transients: true
+  # Safety expiry for cached entries; write-driven invalidation is what
+  # actually keeps them correct.
+  default_ttl: 5m
+  # Bounds for the in-memory store.
+  max_entries: 10000
+  max_bytes: 268435456        # 256 MiB in total
+  max_result_bytes: 1048576   # skip results larger than this (1 MiB)
+  # Directory holding the cache rules, e.g. the WooCommerce profile.
+  # Default: the conf.d directory next to this file. Apply changes without
+  # restarting: systemctl reload gora
+  # rules_dir: /etc/gora/conf.d
+  # Repopulate the autoloaded options snapshot in the background right after
+  # a write invalidates it, so the next visitor finds it warm.
+  warmup: true
+
 status:
   # Local unix socket exposing runtime state to `gora status` (read-only).
   # Empty disables it.

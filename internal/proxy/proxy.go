@@ -18,17 +18,19 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
 
+	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 )
 
-// Options wires the Server's collaborators. TLS is optional.
+// Options wires the Server's collaborators. Cache and TLS are optional.
 type Options struct {
 	Listen  config.Listen
 	Users   []config.User
 	PoolCfg config.Pool
 	Pool    *pool.Pool
-	TLS     *tls.Config // client-facing TLS, advertised when non-nil
+	Cache   *cache.Cache // nil disables the query cache
+	TLS     *tls.Config  // client-facing TLS, advertised when non-nil
 	Log     *slog.Logger
 }
 
@@ -39,6 +41,7 @@ type Server struct {
 	drain      time.Duration
 	pool       *pool.Pool
 	cfg        config.Pool
+	cache      *cache.Cache
 	log        *slog.Logger
 
 	srvConf *server.Server
@@ -77,6 +80,7 @@ func New(o Options) *Server {
 		drain:      o.Listen.DrainTimeout.Std(),
 		pool:       o.Pool,
 		cfg:        o.PoolCfg,
+		cache:      o.Cache,
 		log:        o.Log,
 		srvConf:    srvConf,
 		auth:       auth,

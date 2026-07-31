@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
@@ -76,6 +78,27 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 	}
 	defer backendPool.Close()
 
+	rulesDir := rulesDirFor(cfg, configPath)
+	rules, err := cache.LoadRuleDir(rulesDir)
+	if err != nil {
+		return err
+	}
+
+	var queryCache *cache.Cache
+	if cfg.Cache.Enabled {
+		queryCache, err = cache.New(cfg.Cache, backendPool, rules, log)
+		if err != nil {
+			return err
+		}
+		log.Info("query cache enabled",
+			"table_prefix", cfg.Cache.TablePrefix, "rules", len(rules), "rules_dir", rulesDir)
+		if cfg.Cache.Warmup {
+			warmer := cache.NewWarmer(queryCache, backendPool, log)
+			go warmer.Run(ctx)
+			queryCache.SetRefetch(warmer.Trigger)
+		}
+	}
+
 	listenTLS, err := clientTLS(cfg.Listen)
 	if err != nil {
 		return err
@@ -89,13 +112,14 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		Users:   cfg.Users,
 		PoolCfg: cfg.Pool,
 		Pool:    backendPool,
+		Cache:   queryCache,
 		TLS:     listenTLS,
 		Log:     log,
 	})
 
 	if cfg.Status.Socket != "" {
 		collect := func() status.Snapshot {
-			return status.Snapshot{
+			snap := status.Snapshot{
 				Version:       version,
 				PID:           os.Getpid(),
 				UptimeSeconds: int64(time.Since(started).Seconds()),
@@ -105,6 +129,11 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 				Clients:       srv.Stat(),
 				Pool:          backendPool.Stat(),
 			}
+			if queryCache != nil {
+				rep := queryCache.ReportStats()
+				snap.Cache = &rep
+			}
+			return snap
 		}
 		go func() {
 			if err := status.Serve(ctx, cfg.Status.Socket, collect, log); err != nil {
@@ -113,7 +142,7 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		}()
 	}
 
-	go watchReloads(ctx, configPath, log)
+	go watchReloads(ctx, configPath, rulesDir, queryCache, log)
 
 	if err := srv.Run(ctx); err != nil {
 		return err
@@ -134,10 +163,25 @@ func clientTLS(cfg config.Listen) (*tls.Config, error) {
 	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 }
 
-// watchReloads re-reads the configuration on every SIGHUP. A configuration
-// that no longer parses is reported and ignored: a reload must never be
-// able to take down an instance that is serving traffic.
-func watchReloads(ctx context.Context, configPath string, log *slog.Logger) {
+// rulesDirFor returns the conf.d directory: the configured one, or the
+// conf.d sitting next to config.yaml.
+func rulesDirFor(cfg config.Config, configPath string) string {
+	if cfg.Cache.RulesDir != "" {
+		return cfg.Cache.RulesDir
+	}
+	return filepath.Join(filepath.Dir(configPath), "conf.d")
+}
+
+// watchReloads applies the conf.d drop-ins again on every SIGHUP, without
+// dropping a single client connection. Anything that no longer parses is
+// reported and ignored: a reload must never be able to take down an
+// instance that is serving traffic.
+//
+// The main configuration file is re-read only to validate it — listeners,
+// pool and credentials are not swapped under running sessions. The rules
+// are the part meant to change while gora runs, which is what makes adding
+// one during an incident a `systemctl reload` away.
+func watchReloads(ctx context.Context, configPath, rulesDir string, queryCache *cache.Cache, log *slog.Logger) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -153,7 +197,19 @@ func watchReloads(ctx context.Context, configPath string, log *slog.Logger) {
 			log.Error("reload failed, the running configuration is unchanged", "error", err)
 			continue
 		}
-		log.Info("configuration re-read", "config", configPath)
+		rules, err := cache.LoadRuleDir(rulesDir)
+		if err != nil {
+			log.Error("reload failed, keeping the previous rules", "error", err)
+			continue
+		}
+		if queryCache != nil {
+			if err := queryCache.SetRules(rules); err != nil {
+				log.Error("reload failed, keeping the previous rules", "error", err)
+				continue
+			}
+		}
+		log.Info("configuration reloaded", "config", configPath,
+			"rules", len(rules), "rules_dir", rulesDir)
 	}
 }
 
@@ -240,6 +296,26 @@ func printStatus(configPath string, stdout io.Writer) error {
 	} else {
 		fmt.Fprintln(stdout, "          no client ever waited for a connection")
 	}
+
+	if c := snap.Cache; c != nil {
+		total := c.Hits + c.Misses
+		ratio := 0.0
+		if total > 0 {
+			ratio = float64(c.Hits) / float64(total) * 100
+		}
+		prefix := c.Prefix
+		if prefix == "" {
+			prefix = "(not detected yet)"
+		}
+		fmt.Fprintf(stdout, "cache:    prefix %s, %d entries, %.1f MiB\n",
+			prefix, c.Entries, float64(c.Bytes)/(1<<20))
+		fmt.Fprintf(stdout, "          hit ratio %.1f%% (%d hits / %d misses)\n",
+			ratio, c.Hits, c.Misses)
+		for name, src := range c.Sources {
+			fmt.Fprintf(stdout, "          %-22s %d hits, %d entries, %.1f MiB\n",
+				name, src.Hits, src.Entries, float64(src.Bytes)/(1<<20))
+		}
+	}
 	return nil
 }
 
@@ -266,12 +342,33 @@ func checkConfig(configPath string, stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "  pool:     max %d, idle %d-%d, multiplexing %s\n",
 		cfg.Pool.MaxOpen, cfg.Pool.MinIdle, cfg.Pool.MaxIdle, multiplexing)
+
 	socket := cfg.Status.Socket
 	if socket == "" {
 		socket = "disabled"
 	}
 	fmt.Fprintf(stdout, "  status:   %s\n", socket)
 	fmt.Fprintf(stdout, "  log:      %s, level %s, format %s\n", cfg.Log.Path, cfg.Log.Level, cfg.Log.Format)
+
+	// The conf.d drop-ins are the part most likely to be wrong, and the part
+	// a reload applies, so validating them is most of the value here.
+	if !cfg.Cache.Enabled {
+		fmt.Fprintln(stdout, "  cache:    disabled")
+		return nil
+	}
+	rulesDir := rulesDirFor(cfg, configPath)
+	rules, err := cache.LoadRuleDir(rulesDir)
+	if err != nil {
+		return err
+	}
+	prefix := cfg.Cache.TablePrefix
+	if prefix == config.AutoPrefix {
+		prefix = "auto (detected from the database)"
+	}
+	fmt.Fprintf(stdout, "  cache:    prefix %s, %d rule(s) from %s\n", prefix, len(rules), rulesDir)
+	for _, r := range rules {
+		fmt.Fprintf(stdout, "              - %s\n", r.Name)
+	}
 	return nil
 }
 

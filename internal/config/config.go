@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -22,6 +23,7 @@ type Config struct {
 	Backend Backend `yaml:"backend"`
 	Users   []User  `yaml:"users"`
 	Pool    Pool    `yaml:"pool"`
+	Cache   Cache   `yaml:"cache"`
 	Status  Status  `yaml:"status"`
 	Log     Log     `yaml:"log"`
 }
@@ -131,6 +133,40 @@ type Breaker struct {
 	ProbeInterval Duration `yaml:"probe_interval"`
 }
 
+// AutoPrefix asks gora to discover the WordPress table prefix from the
+// database instead of being told.
+const AutoPrefix = "auto"
+
+// Cache controls the WordPress-aware query cache.
+type Cache struct {
+	Enabled bool `yaml:"enabled"`
+	// TablePrefix is WordPress's $table_prefix, or "auto" to detect it from
+	// the first database gora sees. Installations that put several
+	// prefixes behind one gora should name theirs explicitly.
+	TablePrefix string `yaml:"table_prefix"`
+	// AutoloadOptions caches the autoloaded options query.
+	AutoloadOptions bool `yaml:"autoload_options"`
+	// Transients caches transient reads from the options table.
+	Transients bool `yaml:"transients"`
+	// DefaultTTL is the safety expiry for cached entries; write-driven
+	// invalidation is the mechanism that actually keeps them correct.
+	DefaultTTL Duration `yaml:"default_ttl"`
+	// MaxEntries bounds how many result sets are held.
+	MaxEntries int `yaml:"max_entries"`
+	// MaxBytes bounds how much memory they take (0 = unbounded). Entry
+	// counts alone do not: a thousand small rows and a thousand large ones
+	// are the same number and very different amounts of RAM.
+	MaxBytes int `yaml:"max_bytes"`
+	// MaxResultBytes skips caching results larger than this.
+	MaxResultBytes int `yaml:"max_result_bytes"`
+	// RulesDir holds the conf.d drop-ins. Empty means "conf.d next to the
+	// configuration file".
+	RulesDir string `yaml:"rules_dir"`
+	// Warmup repopulates the autoloaded options snapshot in the background
+	// right after a write invalidates it.
+	Warmup bool `yaml:"warmup"`
+}
+
 // Status exposes runtime state to `gora status` over a local unix socket.
 // An empty socket disables it.
 type Status struct {
@@ -174,6 +210,17 @@ func Default() Config {
 				Failures:      3,
 				ProbeInterval: Duration(2 * time.Second),
 			},
+		},
+		Cache: Cache{
+			Enabled:         true,
+			TablePrefix:     AutoPrefix,
+			AutoloadOptions: true,
+			Transients:      true,
+			DefaultTTL:      Duration(5 * time.Minute),
+			MaxEntries:      10000,
+			MaxBytes:        256 << 20, // 256 MiB
+			MaxResultBytes:  1 << 20,   // 1 MiB
+			Warmup:          true,
 		},
 		Status: Status{Socket: "/run/gora/status.sock"},
 		Log:    Log{Level: "info", Format: "text", Path: "/var/log/gora"},
@@ -219,6 +266,9 @@ func (c *Config) Validate() error {
 		return err
 	}
 	if err := c.validatePool(); err != nil {
+		return err
+	}
+	if err := c.validateCache(); err != nil {
 		return err
 	}
 
@@ -324,6 +374,40 @@ func (c *Config) validatePool() error {
 	}
 	if p.Breaker.Failures > 0 && p.Breaker.ProbeInterval <= 0 {
 		return fmt.Errorf("pool.breaker.probe_interval must be > 0")
+	}
+	return nil
+}
+
+// prefixRe is what a table prefix may look like: MySQL identifiers, no
+// quoting games. It also catches the trailing space nobody notices.
+var prefixRe = regexp.MustCompile(`^[A-Za-z0-9_$]+$`)
+
+func (c *Config) validateCache() error {
+	if !c.Cache.Enabled {
+		return nil
+	}
+	cache := c.Cache
+	if cache.TablePrefix == "" {
+		return fmt.Errorf(`cache.table_prefix is required when the cache is enabled (use "auto" to detect it)`)
+	}
+	if cache.TablePrefix != AutoPrefix && !prefixRe.MatchString(cache.TablePrefix) {
+		return fmt.Errorf("cache.table_prefix %q is not a valid table name prefix", cache.TablePrefix)
+	}
+	if cache.DefaultTTL <= 0 {
+		return fmt.Errorf("cache.default_ttl must be > 0")
+	}
+	if cache.MaxEntries < 1 {
+		return fmt.Errorf("cache.max_entries must be >= 1")
+	}
+	if cache.MaxResultBytes < 1 {
+		return fmt.Errorf("cache.max_result_bytes must be >= 1")
+	}
+	if cache.MaxBytes < 0 {
+		return fmt.Errorf("cache.max_bytes must be >= 0 (0 = unbounded)")
+	}
+	if cache.MaxBytes > 0 && cache.MaxBytes < cache.MaxResultBytes {
+		return fmt.Errorf("cache.max_bytes (%d) is smaller than cache.max_result_bytes (%d): nothing would ever stay cached",
+			cache.MaxBytes, cache.MaxResultBytes)
 	}
 	return nil
 }

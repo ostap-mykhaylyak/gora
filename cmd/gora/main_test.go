@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 )
 
@@ -31,6 +33,30 @@ func TestDefaultConfigTemplateIsValid(t *testing.T) {
 	}
 	if cfg.Listen.Address == "" || cfg.Backend.Address == "" {
 		t.Fatalf("the template left required fields empty: %+v", cfg)
+	}
+}
+
+// The WooCommerce profile ships with every installation, so a mistake in it
+// is a mistake in everyone's conf.d. It has to load, and its rules have to
+// compile against a real prefix.
+func TestWooCommerceProfileLoads(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "woocommerce.yaml"), defaultWooCommerceRules, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rules, err := cache.LoadRuleDir(dir)
+	if err != nil {
+		t.Fatalf("the shipped WooCommerce profile does not load: %v", err)
+	}
+	if len(rules) == 0 {
+		t.Fatal("the shipped WooCommerce profile has no active rules")
+	}
+
+	cfg := config.Default().Cache
+	cfg.TablePrefix = "shop7_"
+	if _, err := cache.New(cfg, nil, rules, slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("the profile does not compile against a custom prefix: %v", err)
 	}
 }
 

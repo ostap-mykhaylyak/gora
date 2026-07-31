@@ -15,6 +15,9 @@ import (
 //go:embed config.default.yaml
 var defaultConfig []byte
 
+//go:embed woocommerce.default.yaml
+var defaultWooCommerceRules []byte
+
 //go:embed gora.service
 var serviceUnit string
 
@@ -71,7 +74,14 @@ func install(configPath string, stdout io.Writer) error {
 	if err := os.Chown(configPath, uid, gid); err != nil {
 		return fmt.Errorf("chown %s: %w", configPath, err)
 	}
+	// The WooCommerce profile is a drop-in, not part of config.yaml: it is
+	// meant to be edited, reloaded and, if a shop needs something else,
+	// replaced by a file of your own next to it.
+	if err := writeFile(filepath.Join(confD, "woocommerce.yaml"), defaultWooCommerceRules, 0o644); err != nil {
+		return err
+	}
 	fmt.Fprintln(stdout, "wrote configuration:", configPath)
+	fmt.Fprintln(stdout, "wrote cache rules:  ", filepath.Join(confD, "woocommerce.yaml"))
 
 	// The unit's ExecStart follows --config, so a non-default path keeps
 	// working after a reinstall.

@@ -113,6 +113,14 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 	case strings.HasPrefix(upper, "KILL QUERY"):
 		h.srv.Kills.Add(1)
 		return okResult(), nil
+	case strings.Contains(upper, "INFORMATION_SCHEMA.TABLES"):
+		// The schema lookup gora uses to discover the WordPress table
+		// prefix. Answering it makes that path testable.
+		rs, err := mysql.BuildSimpleTextResultset([]string{"TABLE_NAME"}, [][]any{{"wp_options"}})
+		if err != nil {
+			return nil, err
+		}
+		return mysql.NewResult(rs), nil
 	case strings.HasPrefix(upper, "SELECT"):
 		rs, err := mysql.BuildSimpleTextResultset([]string{"v"}, [][]any{{int64(1)}})
 		if err != nil {
