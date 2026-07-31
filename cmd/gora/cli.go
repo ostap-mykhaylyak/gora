@@ -29,6 +29,7 @@ Options (always two dashes):
   --config <path> configuration file (default /etc/gora/config.yaml)
   --init          install gora as a systemd service and exit
   --check-config  validate the configuration and exit
+  --advice        print what the profiler has suggested, and exit
   --version       print the version and exit
   --help          print this help and exit
 `
@@ -41,6 +42,7 @@ type options struct {
 	configPath  string
 	install     bool
 	checkConfig bool
+	advice      bool
 	version     bool
 	help        bool
 }
@@ -79,6 +81,11 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.checkConfig = true
+			case "advice":
+				if err := noValue(name, hasValue); err != nil {
+					return opts, err
+				}
+				opts.advice = true
 			case "version":
 				if err := noValue(name, hasValue); err != nil {
 					return opts, err
@@ -113,10 +120,13 @@ func parseArgs(args []string) (options, error) {
 		}
 	}
 
-	if opts.command != "" && (opts.install || opts.checkConfig) {
+	if opts.command != "" && (opts.install || opts.checkConfig || opts.advice) {
 		action := "--init"
-		if opts.checkConfig {
+		switch {
+		case opts.checkConfig:
 			action = "--check-config"
+		case opts.advice:
+			action = "--advice"
 		}
 		return opts, fmt.Errorf("%s does not take a command (drop %q)", action, opts.command)
 	}

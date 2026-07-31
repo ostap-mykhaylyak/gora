@@ -54,6 +54,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = install(opts.configPath, stdout)
 	case opts.checkConfig:
 		err = checkConfig(opts.configPath, stdout)
+	case opts.advice:
+		err = printAdvice(opts.configPath, stdout)
 	default:
 		switch opts.command {
 		case "start":

@@ -5,12 +5,14 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/confd"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
+	"github.com/ostap-mykhaylyak/gora/internal/profile"
 )
 
 // writeDefaultConfig materialises the embedded template so it can be loaded
@@ -126,6 +128,46 @@ func TestRunCheckConfig(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "is valid") {
 		t.Fatalf("--check-config output = %q", out.String())
+	}
+}
+
+// --advice reads the file the profiler writes, so it works whether or not
+// gora is running.
+func TestRunAdvice(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// profiling.advice_file is validated as an absolute POSIX path, on
+		// purpose: gora runs on Linux and the check must give the same
+		// answer wherever the tests happen to run.
+		t.Skip("a Windows temp path is not an absolute POSIX path")
+	}
+
+	dir := t.TempDir()
+	adviceFile := filepath.Join(dir, "advice.json")
+
+	store := profile.NewStore(adviceFile)
+	store.Add(profile.Advice{
+		Kind:   profile.KindIndex,
+		Table:  "wp_postmeta",
+		Reason: "this statement scans wp_postmeta",
+		Apply:  "ALTER TABLE wp_postmeta ADD INDEX idx_gora_meta_key (meta_key);",
+	})
+	if err := store.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	path := filepath.Join(dir, "config.yaml")
+	body := "backend:\n  address: \"127.0.0.1:3306\"\n  username: \"u\"\n" +
+		"profiling:\n  enabled: true\n  advice_file: \"" + adviceFile + "\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--advice", "--config", path}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "ALTER TABLE wp_postmeta") {
+		t.Fatalf("--advice did not print the suggestion: %q", out.String())
 	}
 }
 

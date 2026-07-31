@@ -7,9 +7,9 @@ A *gora* is the channel that carries water to a mill: the queries are the
 water, MySQL is the mill.
 
 > ⚠️ **Early development.** gora proxies traffic, pools connections,
-> multiplexes them and caches WordPress's hottest reads. The traffic rules,
-> the profiler and the replication manager are still to come — see the
-> roadmap.
+> multiplexes them, caches WordPress's hottest reads, and can rewrite,
+> refuse, throttle and profile what goes through it. The read/write split
+> and the replication manager are still to come — see the roadmap.
 
 ## Features
 
@@ -89,6 +89,15 @@ water, MySQL is the mill.
   `listen.max_connections` caps concurrent clients, and `pool.max_query_time`
   kills any statement running longer than the limit so one runaway query
   cannot hold a pooled connection hostage.
+- **Profiling and advice** — with `profiling.enabled` gora turns its
+  position into guidance. It sees every statement, so it aggregates them by
+  shape: calls, total/avg/max time, rows, cache hit ratio, heaviest first,
+  and logs anything slower than `slow_query` immediately. Then it explains
+  the heaviest ones against the real schema and says what to do — the
+  `ALTER TABLE` for a missing index, a `FULLTEXT` index for a search no
+  B-tree can serve, the conf.d rule for a known antipattern. It suggests;
+  it never runs DDL. Suggestions are kept in `advice_file`, so they survive
+  a restart and `gora --advice` prints them.
 - **Graceful shutdown** — a stop stops accepting, lets the statements already
   running finish (up to `listen.drain_timeout`) and only then closes client
   connections. Idle sessions are not waited for.
@@ -114,6 +123,7 @@ gora status                   # print the state of the running instance
 ```sh
 gora --init                   # install as a systemd service
 gora --check-config           # validate the configuration and exit
+gora --advice                 # print what the profiler has suggested
 gora --config /etc/gora/config.yaml
 gora --version
 gora --help
@@ -186,6 +196,15 @@ cache:
   max_bytes: 268435456
   max_result_bytes: 1048576
   warmup: true
+
+profiling:
+  enabled: false
+  slow_query: 500ms
+  report_interval: 10m
+  top_queries: 20
+  suggest_indexes: true
+  suggest_rewrites: true
+  advice_file: /var/log/gora/advice.json
 
 status:
   socket: /run/gora/status.sock   # read-only, feeds `gora status`
@@ -274,8 +293,8 @@ per-customer data — carts, sessions, orders.
 | ~~M0~~ | skeleton | CLI, configuration, logging, service control, `--init`, status socket, CI |
 | ~~M1~~ | data plane | MySQL protocol, connection pool, keepalive, per-query multiplexing, TLS |
 | ~~M2~~ | cache | WordPress-aware query cache, conf.d rules, hot reload, warm-up |
-| **M3** | traffic | query rewriting, firewall, per-digest throttling |
-| M4 | profiling | slow query log, aggregated report, index and rewrite advisor |
+| ~~M3~~ | traffic | query rewriting, firewall, per-digest throttling |
+| **M4** | profiling | slow query log, aggregated report, index and rewrite advisor |
 | M5 | topology | multiple nodes, health checks, read/write split, degraded mode |
 | M6 | replication | GTID provisioning, seeding, monitoring, failover |
 | M7 | observability | `gora top`, extended status, documentation |

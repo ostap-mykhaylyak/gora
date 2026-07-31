@@ -16,6 +16,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/profile"
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/statement"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
@@ -54,6 +55,7 @@ type session struct {
 	rewriter *rewrite.Rewriter
 	firewall *firewall.Firewall
 	throttle *throttle.Limiter
+	prof     *profile.Profiler // nil when profiling is off
 	log      *slog.Logger
 
 	mu      sync.Mutex // guards everything below, including against the pinger
@@ -99,6 +101,7 @@ func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 		rewriter: srv.rewriter,
 		firewall: srv.firewall,
 		throttle: srv.throttle,
+		prof:     srv.prof,
 		log:      log,
 		mux:      srv.cfg.Multiplexing,
 		lastUse:  time.Now(),
@@ -433,6 +436,7 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	s.foundRowsKnown = false
 
 	kind := statement.Classify(query)
+	var dur time.Duration
 	exec := func() (*mysql.Result, error) {
 		// Throttling happens here rather than at the top of the handler:
 		// it protects the database, and a statement answered from memory
@@ -448,7 +452,9 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 			return nil, err
 		}
 		stopWatchdog := s.queryWatchdog(c, query)
+		start := time.Now()
 		r, err := c.Execute(query)
+		dur = time.Since(start)
 		stopWatchdog()
 		s.finish(err)
 		return r, err
@@ -468,6 +474,7 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	} else {
 		r, err = exec()
 	}
+	s.observeProfile(query, dur, r, !executed, err)
 	if err != nil {
 		return r, err
 	}
@@ -481,6 +488,23 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 	}
 	s.maybeRelease()
 	return r, nil
+}
+
+// observeProfile forwards one execution to the profiler, when it is on.
+// Must be called with s.mu held.
+func (s *session) observeProfile(query string, dur time.Duration, r *mysql.Result, cached bool, err error) {
+	if s.prof == nil {
+		return
+	}
+	var rows uint64
+	if r != nil {
+		if r.HasResultset() {
+			rows = uint64(len(r.Values))
+		} else {
+			rows = r.AffectedRows
+		}
+	}
+	s.prof.Observe(s.db, query, dur, rows, cached, err)
 }
 
 // checkFirewall refuses a statement a rule says must not run. A dry-run
@@ -528,6 +552,7 @@ func (s *session) handleListing(query string) (*mysql.Result, error) {
 		s.foundRowsKnown = true
 		s.calcPending = ""
 		s.lastUse = time.Now()
+		s.observeProfile(query, 0, r, true, nil)
 		s.maybeRelease()
 		return r, nil
 	}
@@ -543,9 +568,11 @@ func (s *session) handleListing(query string) (*mysql.Result, error) {
 		return nil, err
 	}
 	stopWatchdog := s.queryWatchdog(c, query)
+	start := time.Now()
 	r, err := c.Execute(query)
 	stopWatchdog()
 	s.finish(err)
+	s.observeProfile(query, time.Since(start), r, false, err)
 	if err != nil {
 		return r, err
 	}
@@ -710,9 +737,11 @@ func (s *session) HandleStmtExecute(context any, query string, args []any) (*mys
 	if s.conn != nil {
 		stopWatchdog = s.queryWatchdog(s.conn, query)
 	}
+	start := time.Now()
 	r, err := stmt.Execute(args...)
 	stopWatchdog()
 	s.finish(err)
+	s.observeProfile(query, time.Since(start), r, false, err)
 	if err == nil {
 		kind := statement.Classify(query)
 		s.trackSafety(kind, query, r)

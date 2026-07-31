@@ -102,6 +102,28 @@ cache:
   # a write invalidates it, so the next visitor finds it warm.
   warmup: true
 
+profiling:
+  # Turn gora's position into advice: it sees every statement, with its
+  # timing, its row count and whether the cache answered it.
+  enabled: false
+  # Log any statement slower than this immediately (0 disables it).
+  slow_query: 500ms
+  # How often the aggregated report is logged. Each report describes its own
+  # interval: calls, total/avg/max time, rows, cache hit ratio, heaviest
+  # first.
+  report_interval: 10m
+  # How many statements the report details.
+  top_queries: 20
+  # Run EXPLAIN on the heaviest statements and suggest the index to add,
+  # with the ALTER TABLE ready to run. gora never runs DDL itself.
+  suggest_indexes: true
+  # Scan statements for known antipatterns (ORDER BY RAND(),
+  # SQL_CALC_FOUND_ROWS, leading-wildcard LIKE, huge OFFSET).
+  suggest_rewrites: true
+  # Where the suggestions are kept, so they survive a restart and can be
+  # read with `gora --advice`. Empty logs them and keeps nothing.
+  advice_file: /var/log/gora/advice.json
+
 status:
   # Local unix socket exposing runtime state to `gora status` (read-only).
   # Empty disables it.

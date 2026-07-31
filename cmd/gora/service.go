@@ -19,6 +19,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/profile"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/status"
@@ -111,6 +112,16 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 	}
 	traffic.log(log, rulesDir)
 
+	var profiler *profile.Profiler
+	if cfg.Profiling.Enabled {
+		profiler = profile.New(cfg.Profiling, backendPool, log)
+		go profiler.Run(ctx)
+		log.Info("profiling enabled",
+			"slow_query", cfg.Profiling.SlowQuery,
+			"report_interval", cfg.Profiling.ReportInterval,
+			"advice_file", cfg.Profiling.AdviceFile)
+	}
+
 	listenTLS, err := clientTLS(cfg.Listen)
 	if err != nil {
 		return err
@@ -128,6 +139,7 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		Rewriter: traffic.rewriter,
 		Firewall: traffic.firewall,
 		Throttle: traffic.throttle,
+		Profiler: profiler,
 		TLS:      listenTLS,
 		Log:      log,
 	})
@@ -355,6 +367,48 @@ func printStatus(configPath string, stdout io.Writer) error {
 		for name, src := range c.Sources {
 			fmt.Fprintf(stdout, "          %-22s %d hits, %d entries, %.1f MiB\n",
 				name, src.Hits, src.Entries, float64(src.Bytes)/(1<<20))
+		}
+	}
+	return nil
+}
+
+// printAdvice prints what the profiler has suggested, newest first. It
+// reads the file, so it works whether or not gora is running — the point of
+// keeping the advice on disk is that you can look at it on Monday.
+func printAdvice(configPath string, stdout io.Writer) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
+	}
+	if !cfg.Profiling.Enabled {
+		return fmt.Errorf("profiling is disabled in %s, so there is no advice to show", configPath)
+	}
+	if cfg.Profiling.AdviceFile == "" {
+		return fmt.Errorf("profiling.advice_file is empty in %s: the advice is only logged", configPath)
+	}
+
+	advice, err := profile.ReadAdvice(cfg.Profiling.AdviceFile)
+	if err != nil {
+		return err
+	}
+	if len(advice) == 0 {
+		fmt.Fprintf(stdout, "no advice yet (%s)\n", cfg.Profiling.AdviceFile)
+		return nil
+	}
+
+	fmt.Fprintf(stdout, "%d suggestion(s) from %s\n", len(advice), cfg.Profiling.AdviceFile)
+	for _, a := range advice {
+		fmt.Fprintf(stdout, "\n[%s] seen %d time(s), last %s\n",
+			a.Kind, a.Seen, a.LastSeen.Format(time.RFC3339))
+		if a.Table != "" {
+			fmt.Fprintf(stdout, "  table:  %s\n", a.Table)
+		}
+		if a.Query != "" {
+			fmt.Fprintf(stdout, "  query:  %s\n", a.Query)
+		}
+		fmt.Fprintf(stdout, "  why:    %s\n", a.Reason)
+		if a.Apply != "" {
+			fmt.Fprintf(stdout, "  apply:  %s\n", a.Apply)
 		}
 	}
 	return nil

@@ -24,8 +24,10 @@ type Config struct {
 	Users   []User  `yaml:"users"`
 	Pool    Pool    `yaml:"pool"`
 	Cache   Cache   `yaml:"cache"`
-	Status  Status  `yaml:"status"`
-	Log     Log     `yaml:"log"`
+
+	Profiling Profiling `yaml:"profiling"`
+	Status    Status    `yaml:"status"`
+	Log       Log       `yaml:"log"`
 }
 
 // Listen configures the client-facing listener: the address WordPress points
@@ -189,6 +191,30 @@ type Cache struct {
 	Warmup bool `yaml:"warmup"`
 }
 
+// Profiling controls the query statistics, the slow statement log and the
+// advice gora derives from them. All of it is off by default: it costs a
+// fingerprint per statement and an EXPLAIN per report, which is little, but
+// nothing is the right default for something you did not ask for.
+type Profiling struct {
+	Enabled bool `yaml:"enabled"`
+	// SlowQuery logs any statement slower than this immediately
+	// (0 disables it).
+	SlowQuery Duration `yaml:"slow_query"`
+	// ReportInterval is how often the aggregated report is logged. Each
+	// report describes its own interval.
+	ReportInterval Duration `yaml:"report_interval"`
+	// TopQueries is how many statements the report details, heaviest first.
+	TopQueries int `yaml:"top_queries"`
+	// SuggestIndexes runs EXPLAIN on the heaviest statements and suggests
+	// what to add, with the ALTER TABLE ready to run.
+	SuggestIndexes bool `yaml:"suggest_indexes"`
+	// SuggestRewrites scans statements for known antipatterns.
+	SuggestRewrites bool `yaml:"suggest_rewrites"`
+	// AdviceFile is where suggestions are kept, so they survive a restart
+	// and can be read with `gora --advice`. Empty keeps them in memory.
+	AdviceFile string `yaml:"advice_file"`
+}
+
 // Status exposes runtime state to `gora status` over a local unix socket.
 // An empty socket disables it.
 type Status struct {
@@ -244,6 +270,14 @@ func Default() Config {
 			MaxResultBytes:  1 << 20,   // 1 MiB
 			Warmup:          true,
 		},
+		Profiling: Profiling{
+			SlowQuery:       Duration(500 * time.Millisecond),
+			ReportInterval:  Duration(10 * time.Minute),
+			TopQueries:      20,
+			SuggestIndexes:  true,
+			SuggestRewrites: true,
+			AdviceFile:      "/var/log/gora/advice.json",
+		},
 		Status: Status{Socket: "/run/gora/status.sock"},
 		Log:    Log{Level: "info", Format: "text", Path: "/var/log/gora"},
 	}
@@ -292,6 +326,21 @@ func (c *Config) Validate() error {
 	}
 	if err := c.validateCache(); err != nil {
 		return err
+	}
+	if c.Profiling.Enabled {
+		if c.Profiling.ReportInterval <= 0 {
+			return fmt.Errorf("profiling.report_interval must be > 0")
+		}
+		if c.Profiling.TopQueries < 1 {
+			return fmt.Errorf("profiling.top_queries must be >= 1")
+		}
+		if c.Profiling.SlowQuery < 0 {
+			return fmt.Errorf("profiling.slow_query must be >= 0 (0 disables it)")
+		}
+		if c.Profiling.AdviceFile != "" && !strings.HasPrefix(c.Profiling.AdviceFile, "/") {
+			return fmt.Errorf("profiling.advice_file %q must be an absolute path (empty keeps the advice in memory)",
+				c.Profiling.AdviceFile)
+		}
 	}
 
 	// Deliberately not filepath.IsAbs: gora runs on Linux, and the check

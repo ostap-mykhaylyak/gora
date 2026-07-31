@@ -33,6 +33,36 @@ type Server struct {
 	mu      sync.Mutex
 	queries []string
 	delays  map[string]time.Duration
+	answers map[string]cannedAnswer
+}
+
+// cannedAnswer is a result set a test wants a statement to return.
+type cannedAnswer struct {
+	fields []string
+	rows   [][]any
+}
+
+// Answer makes every statement containing sub return this result set, for
+// the tests that need the backend to say something specific — an EXPLAIN
+// plan, a schema lookup.
+func (s *Server) Answer(sub string, fields []string, rows [][]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.answers == nil {
+		s.answers = make(map[string]cannedAnswer)
+	}
+	s.answers[strings.ToUpper(sub)] = cannedAnswer{fields: fields, rows: rows}
+}
+
+func (s *Server) answerFor(upper string) (cannedAnswer, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for sub, a := range s.answers {
+		if strings.Contains(upper, sub) {
+			return a, true
+		}
+	}
+	return cannedAnswer{}, false
 }
 
 // Delay makes every statement containing sub take at least d, so a test can
@@ -137,6 +167,14 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 	if d := h.srv.delayFor(upper); d > 0 {
 		time.Sleep(d)
 	}
+	if a, ok := h.srv.answerFor(upper); ok {
+		rs, err := mysql.BuildSimpleTextResultset(a.fields, a.rows)
+		if err != nil {
+			return nil, err
+		}
+		return mysql.NewResult(rs), nil
+	}
+
 	switch {
 	case strings.HasPrefix(upper, "KILL QUERY"):
 		h.srv.Kills.Add(1)

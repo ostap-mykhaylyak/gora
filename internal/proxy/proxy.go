@@ -22,6 +22,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
+	"github.com/ostap-mykhaylyak/gora/internal/profile"
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
 )
@@ -37,6 +38,7 @@ type Options struct {
 	Rewriter *rewrite.Rewriter
 	Firewall *firewall.Firewall
 	Throttle *throttle.Limiter
+	Profiler *profile.Profiler
 	TLS      *tls.Config // client-facing TLS, advertised when non-nil
 	Log      *slog.Logger
 }
@@ -52,6 +54,7 @@ type Server struct {
 	rewriter   *rewrite.Rewriter
 	firewall   *firewall.Firewall
 	throttle   *throttle.Limiter
+	prof       *profile.Profiler
 	log        *slog.Logger
 
 	srvConf *server.Server
@@ -94,6 +97,7 @@ func New(o Options) *Server {
 		rewriter:   o.Rewriter,
 		firewall:   o.Firewall,
 		throttle:   o.Throttle,
+		prof:       o.Profiler,
 		log:        o.Log,
 		srvConf:    srvConf,
 		auth:       auth,
