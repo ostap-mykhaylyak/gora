@@ -3,6 +3,7 @@ package topology
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -46,7 +47,8 @@ func build(t *testing.T, replicas int, routing config.Routing) (*Topology, *mysq
 		backend.Replicas = append(backend.Replicas, r.Addr)
 	}
 
-	topo, err := New(backend, poolConfig(), routing, slog.New(slog.DiscardHandler))
+	topo, err := New(backend, poolConfig(), routing,
+		filepath.Join(t.TempDir(), "cluster.json"), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -177,7 +179,7 @@ func TestDeadNodeIsMarkedDown(t *testing.T) {
 		Username:       "gora",
 		ConnectTimeout: config.Duration(200 * time.Millisecond),
 	}
-	topo, err := New(backend, poolConfig(), routingConfig(), slog.New(slog.DiscardHandler))
+	topo, err := New(backend, poolConfig(), routingConfig(), "", slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

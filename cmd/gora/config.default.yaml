@@ -77,9 +77,15 @@ replication:
   #               failover_delay
   failover: manual
   failover_delay: 30s
-  # Where the current primary is recorded, so a promotion survives a restart
-  # of gora. Without it, gora would come back and try to write to the node
-  # this file calls the primary, which by then is a replica.
+
+cluster:
+  # What gora remembers about the servers between restarts: which node is
+  # the primary, and which nodes were added or removed while it was running
+  # — both things this file cannot know, because they happen later.
+  #
+  # It is also how a change made on the command line reaches a running gora,
+  # which re-reads it on every health check. Empty keeps the changes in
+  # memory, so they last until the next restart.
   state_file: /var/lib/gora/cluster.json
 
 pool:

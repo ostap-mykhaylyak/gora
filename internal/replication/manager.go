@@ -31,10 +31,9 @@ const reconcileInterval = 5 * time.Second
 
 // Manager configures and governs the cluster.
 type Manager struct {
-	cfg   config.Replication
-	topo  *topology.Topology
-	log   *slog.Logger
-	state *State
+	cfg  config.Replication
+	topo *topology.Topology
+	log  *slog.Logger
 
 	mu     sync.Mutex
 	status map[string]NodeStatus
@@ -55,33 +54,15 @@ type NodeStatus struct {
 	Checked    bool   `json:"checked"`
 }
 
-// New builds the manager and loads the recorded cluster state, so a
-// promotion made before the last restart is still in force.
+// New builds the manager. The cluster state — who is the primary, which
+// nodes exist — belongs to the topology, which has already read it.
 func New(cfg config.Replication, topo *topology.Topology, log *slog.Logger) (*Manager, error) {
-	m := &Manager{
+	return &Manager{
 		cfg:    cfg,
 		topo:   topo,
 		log:    log,
-		state:  NewState(cfg.StateFile),
 		status: make(map[string]NodeStatus),
-	}
-
-	if err := m.state.Load(); err != nil {
-		return nil, err
-	}
-	if primary := m.state.Primary; primary != "" && primary != topo.Primary().Address {
-		node, ok := topo.Node(primary)
-		if !ok {
-			log.Warn("the recorded primary is not in the configuration, ignoring it",
-				"recorded", primary, "state_file", cfg.StateFile)
-		} else if err := topo.Promote(node); err != nil {
-			log.Warn("could not restore the recorded primary", "recorded", primary, "error", err)
-		} else {
-			log.Info("restored the primary recorded by an earlier promotion",
-				"primary", primary, "state_file", cfg.StateFile)
-		}
-	}
-	return m, nil
+	}, nil
 }
 
 // Status returns what each node last said about its replication.
@@ -118,7 +99,6 @@ func (m *Manager) Run(ctx context.Context) {
 
 // Reconcile reads every node's replication status and fixes what it can.
 func (m *Manager) Reconcile(ctx context.Context) {
-	m.adoptState()
 	primary := m.topo.Primary()
 
 	for _, node := range m.topo.Nodes() {
@@ -143,36 +123,6 @@ func (m *Manager) Reconcile(ctx context.Context) {
 	}
 
 	m.watchPrimary(ctx, primary)
-}
-
-// adoptState picks up a promotion made by another process.
-//
-// `gora --promote` runs on the command line, not inside the service: it
-// changes the servers and records the new primary in the state file. This
-// is how the running instance finds out, without a control socket that
-// could be asked to do anything else.
-func (m *Manager) adoptState() {
-	if m.cfg.StateFile == "" {
-		return
-	}
-	if err := m.state.Load(); err != nil {
-		m.log.Warn("could not re-read the cluster state", "error", err)
-		return
-	}
-	recorded := m.state.Primary
-	if recorded == "" || recorded == m.topo.Primary().Address {
-		return
-	}
-	node, ok := m.topo.Node(recorded)
-	if !ok {
-		return
-	}
-	if err := m.topo.Promote(node); err != nil {
-		m.log.Warn("could not adopt the recorded primary", "recorded", recorded, "error", err)
-		return
-	}
-	m.log.Warn("adopted a primary promoted elsewhere",
-		"primary", recorded, "state_file", m.cfg.StateFile)
 }
 
 // watchPrimary decides whether the primary being unreachable has gone on

@@ -79,7 +79,7 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		"version", version, "pid", os.Getpid(), "config", configPath,
 		"listen", cfg.Listen.Address, "backend", cfg.Backend.Address)
 
-	topo, err := topology.New(cfg.Backend, cfg.Pool, cfg.Routing, log)
+	topo, err := topology.New(cfg.Backend, cfg.Pool, cfg.Routing, cfg.Cluster.StateFile, log)
 	if err != nil {
 		return err
 	}
@@ -137,7 +137,7 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		log.Info("replication management enabled",
 			"failover", cfg.Replication.Failover,
 			"failover_delay", cfg.Replication.FailoverDelay,
-			"state_file", cfg.Replication.StateFile)
+			"state_file", cfg.Cluster.StateFile)
 	}
 
 	var profiler *profile.Profiler

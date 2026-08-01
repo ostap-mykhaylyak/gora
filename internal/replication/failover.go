@@ -46,10 +46,9 @@ func (m *Manager) Promote(ctx context.Context, addr string) error {
 	if err := m.topo.Promote(node); err != nil {
 		return err
 	}
-	if err := m.state.Save(addr, "promoted"); err != nil {
+	if err := m.topo.State().SetPrimary(addr, "promoted"); err != nil {
 		m.log.Error("the promotion worked but could not be recorded; "+
-			"a restart of gora would go back to the old primary",
-			"state_file", m.cfg.StateFile, "error", err)
+			"a restart of gora would go back to the old primary", "error", err)
 	}
 
 	// Everything else follows the new primary. The old one is almost

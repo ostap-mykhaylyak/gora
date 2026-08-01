@@ -34,7 +34,9 @@ Options (always two dashes):
   --advice        print what the profiler has suggested, and exit
   --json          with status: print the raw snapshot instead of a report
   --init-cluster  configure the servers into a replicating cluster and exit
-  --promote <addr> make that node the primary and exit
+  --add-replica <addr>    bring a node into the cluster, without a restart
+  --remove-replica <addr> take a node out of the cluster, without a restart
+  --promote <addr>        make that node the primary and exit
   --version       print the version and exit
   --help          print this help and exit
 `
@@ -43,16 +45,18 @@ Options (always two dashes):
 var commands = []string{"start", "stop", "restart", "reload", "status", "top"}
 
 type options struct {
-	command     string
-	configPath  string
-	install     bool
-	checkConfig bool
-	advice      bool
-	initCluster bool
-	promote     string
-	asJSON      bool
-	version     bool
-	help        bool
+	command       string
+	configPath    string
+	install       bool
+	checkConfig   bool
+	advice        bool
+	initCluster   bool
+	addReplica    string
+	removeReplica string
+	promote       string
+	asJSON        bool
+	version       bool
+	help          bool
 }
 
 // parseArgs turns the command line into options. It never exits the process
@@ -104,18 +108,25 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.initCluster = true
-			case "promote":
+			case "promote", "add-replica", "remove-replica":
 				if !hasValue {
 					i++
 					if i >= len(args) {
-						return opts, fmt.Errorf("--promote needs the address of the node to promote")
+						return opts, fmt.Errorf("--%s needs a node address", name)
 					}
 					value = args[i]
 				}
 				if value == "" {
-					return opts, fmt.Errorf("--promote needs the address of the node to promote")
+					return opts, fmt.Errorf("--%s needs a node address", name)
 				}
-				opts.promote = value
+				switch name {
+				case "promote":
+					opts.promote = value
+				case "add-replica":
+					opts.addReplica = value
+				case "remove-replica":
+					opts.removeReplica = value
+				}
 			case "version":
 				if err := noValue(name, hasValue); err != nil {
 					return opts, err
@@ -151,11 +162,13 @@ func parseArgs(args []string) (options, error) {
 	}
 
 	actions := map[string]bool{
-		"--init":         opts.install,
-		"--check-config": opts.checkConfig,
-		"--advice":       opts.advice,
-		"--init-cluster": opts.initCluster,
-		"--promote":      opts.promote != "",
+		"--init":           opts.install,
+		"--check-config":   opts.checkConfig,
+		"--advice":         opts.advice,
+		"--init-cluster":   opts.initCluster,
+		"--promote":        opts.promote != "",
+		"--add-replica":    opts.addReplica != "",
+		"--remove-replica": opts.removeReplica != "",
 	}
 	var chosen []string
 	for name, on := range actions {

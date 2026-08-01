@@ -99,7 +99,7 @@ func startWith(t *testing.T, s *setup) (*mysqltest.Server, *Server) {
 		routing.HealthInterval = config.Duration(50 * time.Millisecond)
 	}
 
-	topo, err := topology.New(backendCfg, s.pool, routing, log)
+	topo, err := topology.New(backendCfg, s.pool, routing, "", log)
 	if err != nil {
 		t.Fatalf("topology.New: %v", err)
 	}

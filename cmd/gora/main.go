@@ -60,6 +60,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = initCluster(opts.configPath, stdout)
 	case opts.promote != "":
 		err = promote(opts.configPath, opts.promote, stdout)
+	case opts.addReplica != "":
+		err = addReplica(opts.configPath, opts.addReplica, stdout)
+	case opts.removeReplica != "":
+		err = removeReplica(opts.configPath, opts.removeReplica, stdout)
 	default:
 		switch opts.command {
 		case "start":

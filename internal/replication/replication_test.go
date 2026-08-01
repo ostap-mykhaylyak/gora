@@ -19,8 +19,13 @@ const adminPass = "admin-secret"
 
 // cluster starts a fake primary and the requested number of fake replicas,
 // and returns the manager in front of them.
-func cluster(t *testing.T, replicas int, cfg config.Replication) (*Manager, *mysqltest.Server, []*mysqltest.Server) {
+func cluster(t *testing.T, replicas int, cfg config.Replication, state ...string) (*Manager, *mysqltest.Server, []*mysqltest.Server) {
 	t.Helper()
+
+	var statePath string
+	if len(state) > 0 {
+		statePath = state[0]
+	}
 
 	primary := mysqltest.Start(t, adminUser, adminPass)
 	backend := config.Backend{
@@ -46,12 +51,15 @@ func cluster(t *testing.T, replicas int, cfg config.Replication) (*Manager, *mys
 	}
 
 	routing := config.Routing{HealthInterval: config.Duration(time.Minute)}
+	if statePath == "" {
+		statePath = filepath.Join(t.TempDir(), "cluster.json")
+	}
 	topo, err := topology.New(backend, config.Pool{
 		MaxOpen:        2,
 		MaxIdle:        2,
 		PingInterval:   config.Duration(time.Second),
 		AcquireTimeout: config.Duration(time.Second),
-	}, routing, slog.New(slog.DiscardHandler))
+	}, routing, statePath, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("topology.New: %v", err)
 	}
@@ -65,10 +73,6 @@ func cluster(t *testing.T, replicas int, cfg config.Replication) (*Manager, *mys
 		cfg.User = "gora_repl"
 		cfg.Password = "repl-secret"
 	}
-	if cfg.StateFile == "" {
-		cfg.StateFile = filepath.Join(t.TempDir(), "cluster.json")
-	}
-
 	m, err := New(cfg, topo, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -233,39 +237,21 @@ func TestPromote(t *testing.T) {
 // writing to a server that is now a replica.
 func TestPromoteIsRecorded(t *testing.T) {
 	stateFile := filepath.Join(t.TempDir(), "cluster.json")
-	m, _, replicas := cluster(t, 1, config.Replication{Enabled: true, StateFile: stateFile})
+	m, _, replicas := cluster(t, 1, config.Replication{Enabled: true}, stateFile)
 
 	if err := m.Promote(context.Background(), replicas[0].Addr); err != nil {
 		t.Fatalf("Promote: %v", err)
 	}
 
-	state := NewState(stateFile)
+	state := topology.NewState(stateFile)
 	if err := state.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if state.Primary != replicas[0].Addr {
 		t.Fatalf("the state file records %q as the primary, want %q", state.Primary, replicas[0].Addr)
 	}
-	if state.PromotedAt.IsZero() {
+	if state.UpdatedAt.IsZero() {
 		t.Fatal("the state file does not record when the promotion happened")
-	}
-}
-
-// And it is picked up by an instance that did not perform it, which is how
-// `gora --promote` reaches a running service.
-func TestPromotionIsAdoptedFromTheStateFile(t *testing.T) {
-	stateFile := filepath.Join(t.TempDir(), "cluster.json")
-	m, _, replicas := cluster(t, 1, config.Replication{Enabled: true, StateFile: stateFile})
-
-	// Another process promoted the replica and wrote it down.
-	other := NewState(stateFile)
-	if err := other.Save(replicas[0].Addr, "promoted by hand"); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	m.Reconcile(context.Background())
-	if got := m.topo.Primary().Address; got != replicas[0].Addr {
-		t.Fatalf("the running instance still thinks %s is the primary", got)
 	}
 }
 

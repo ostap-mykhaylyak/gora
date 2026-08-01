@@ -114,6 +114,14 @@ and profile what goes through it.
   clone plugin when the primary already has data, and starts them following
   the primary. No `my.cnf` is edited by hand, and a replica that has data of
   its own is refused rather than overwritten.
+- **Nodes come and go without a restart** — a cluster usually starts as one
+  server; the second arrives later, on a working site. `gora --add-replica
+  <addr>` sets the node up (GTIDs, server id, seeding, replication) and puts
+  it into the rotation; `gora --remove-replica <addr>` takes it out and
+  leaves its replication running, because taking a replica out for a backup
+  is the common reason to do it. Both write to `cluster.state_file`, which a
+  running gora re-reads on every health check — no restart, no reload, and
+  no control socket that could be asked to do anything else.
 - **Failover** — when the primary goes, `gora --promote <address>` makes a
   replica the primary: it stops replicating, forgets where it was replicating
   from, becomes writable, and the others are repointed at it. With
@@ -166,8 +174,10 @@ gora top                      # watch what it is doing, refreshed live
 gora --init                   # install as a systemd service
 gora --check-config           # validate the configuration and exit
 gora --advice                 # print what the profiler has suggested
-gora --init-cluster           # configure the servers into a replicating cluster
-gora --promote 10.0.0.11:3306 # make that node the primary
+gora --init-cluster                     # set the servers up as a cluster
+gora --add-replica 10.0.0.11:3306       # bring a node in, live
+gora --remove-replica 10.0.0.11:3306    # take it out, live
+gora --promote 10.0.0.11:3306           # make that node the primary
 gora status --json            # the raw snapshot, for whatever collects it
 gora --config /etc/gora/config.yaml
 gora --version
@@ -231,7 +241,9 @@ replication:
   password: "change-me"
   failover: manual           # manual | automatic
   failover_delay: 30s
-  state_file: /var/lib/gora/cluster.json
+
+cluster:
+  state_file: /var/lib/gora/cluster.json   # the primary, and nodes added live
 
 pool:
   max_open: 100
@@ -337,6 +349,47 @@ behave the way the numbers suggest. Names must be unique within a section.
 
 Only cache queries whose answer is the same for every visitor. Never cache
 per-customer data — carts, sessions, orders.
+
+## Growing from one server
+
+Start with one. `backend.replicas` empty is a complete configuration, and
+everything below the split — pooling, multiplexing, the cache, the traffic
+rules, the profiler — works exactly the same on a single server.
+
+When one is no longer enough, the second one joins while the site is up:
+
+```sh
+# on the new machine: an empty MySQL with binary logging on (the default in 8)
+gora --add-replica 10.0.0.11:3306
+```
+
+With `replication.enabled` that sets the node up from nothing — GTIDs, a
+server id of its own, the replication account, a clone of the primary if
+there is data to copy — and only then puts it into the read rotation, so it
+never answers a query with data from whenever it was last written to.
+Without it, gora assumes the node is already replicating and simply starts
+using it.
+
+Taking one out is the same in reverse:
+
+```sh
+gora --remove-replica 10.0.0.11:3306
+```
+
+It stops receiving traffic immediately and keeps replicating, so a node
+removed for a backup or an upgrade can be added back with one command.
+
+Both are recorded in `cluster.state_file`, which is what a running gora
+re-reads on every health check. Nothing is restarted, and no connection is
+dropped. The effective set of nodes is
+
+```
+backend.replicas ∪ added − removed
+```
+
+so a node added this way survives an edit of `config.yaml`, a node removed
+this way stays removed even though the file still lists it, and writing it
+into `backend.replicas` afterwards — the tidy thing to do — changes nothing.
 
 ## Operating gora
 

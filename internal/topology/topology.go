@@ -88,8 +88,17 @@ type NodeStats struct {
 
 // Topology is the set of nodes gora forwards to.
 type Topology struct {
-	cfg config.Routing
-	log *slog.Logger
+	cfg     config.Routing
+	backend config.Backend
+	poolCfg config.Pool
+	log     *slog.Logger
+
+	// state is the record membership and promotions are read from and
+	// written to, so a change made on the command line reaches a running
+	// gora without a restart and without a socket that could be asked to do
+	// anything else.
+	state              *State
+	configuredReplicas []string
 
 	mu       sync.RWMutex
 	primary  *Node
@@ -105,8 +114,22 @@ type Topology struct {
 
 // New builds the topology and its pools. Nothing is dialled here: a node
 // that is down must delay traffic, not startup.
-func New(backend config.Backend, poolCfg config.Pool, routing config.Routing, log *slog.Logger) (*Topology, error) {
-	t := &Topology{cfg: routing, log: log, stop: make(chan struct{})}
+//
+// statePath is where membership changes and promotions are recorded; empty
+// keeps them in memory, which means they last until gora restarts.
+func New(backend config.Backend, poolCfg config.Pool, routing config.Routing, statePath string, log *slog.Logger) (*Topology, error) {
+	t := &Topology{
+		cfg:                routing,
+		backend:            backend,
+		poolCfg:            poolCfg,
+		log:                log,
+		state:              NewState(statePath),
+		configuredReplicas: backend.Replicas,
+		stop:               make(chan struct{}),
+	}
+	if err := t.state.Load(); err != nil {
+		return nil, err
+	}
 
 	primary, err := t.newNode(backend, backend.Address, RolePrimary, poolCfg, log)
 	if err != nil {
@@ -114,13 +137,27 @@ func New(backend config.Backend, poolCfg config.Pool, routing config.Routing, lo
 	}
 	t.primary = primary
 
-	for _, addr := range backend.Replicas {
+	for _, addr := range t.state.Members(backend.Replicas) {
 		replica, err := t.newNode(backend, addr, RoleReplica, poolCfg, log)
 		if err != nil {
 			t.Close()
 			return nil, err
 		}
 		t.replicas = append(t.replicas, replica)
+	}
+
+	// A promotion recorded earlier is still in force: coming back believing
+	// the configuration would mean writing to a node that is now a replica.
+	if recorded := t.state.PrimaryAddr(); recorded != "" && recorded != t.primary.Address {
+		node, ok := t.Node(recorded)
+		if !ok {
+			log.Warn("the recorded primary is not part of the cluster, ignoring it",
+				"recorded", recorded, "state_file", statePath)
+		} else if err := t.Promote(node); err != nil {
+			log.Warn("could not restore the recorded primary", "recorded", recorded, "error", err)
+		} else {
+			log.Info("restored the primary recorded by an earlier promotion", "primary", recorded)
+		}
 	}
 	return t, nil
 }
@@ -328,6 +365,7 @@ func (t *Topology) Run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
+		t.syncState()
 		t.checkAll(ctx)
 	}
 }

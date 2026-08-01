@@ -51,11 +51,77 @@ func (m *Manager) Provision(ctx context.Context, out io.Writer) error {
 		}
 	}
 
-	if err := m.state.Save(primaryAddr, "provisioned"); err != nil {
+	if err := m.topo.State().SetPrimary(primaryAddr, "provisioned"); err != nil {
 		return err
 	}
 	fmt.Fprintln(out, "\nthe cluster is set up. Check it with: gora status")
 	return nil
+}
+
+// AddReplica provisions a node that was not part of the cluster and starts
+// it replicating from the current primary.
+//
+// It is the one-node version of Provision, and it exists because a cluster
+// usually starts as one server: the second one arrives later, on a working
+// site, and nothing about that should require a restart.
+func (m *Manager) AddReplica(ctx context.Context, addr string, out io.Writer) error {
+	primaryAddr := m.topo.Primary().Address
+	if addr == primaryAddr {
+		return fmt.Errorf("%s is the primary", addr)
+	}
+
+	primary, err := m.connect(ctx, primaryAddr)
+	if err != nil {
+		return err
+	}
+	defer primary.Close()
+
+	// The replication account may not exist yet: this can be the first
+	// replica a single-server installation ever had.
+	if err := m.createReplicationUser(primary, out); err != nil {
+		return err
+	}
+	primaryHasData, err := hasUserData(primary)
+	if err != nil {
+		return err
+	}
+
+	serverID, err := m.nextServerID(ctx)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(out, "replica %s\n", addr)
+	return m.provisionReplica(ctx, addr, primaryAddr, serverID, primaryHasData, out)
+}
+
+// nextServerID picks an identity no node in the cluster is using. Counting
+// the nodes would do until somebody removes one and adds another, at which
+// point two servers would share an id and replication would stop with an
+// error nobody expects to be about arithmetic.
+func (m *Manager) nextServerID(ctx context.Context) (uint32, error) {
+	var highest uint64
+	reachable := 0
+
+	for _, node := range m.topo.Nodes() {
+		conn, err := m.connect(ctx, node.Address)
+		if err != nil {
+			continue
+		}
+		id, err := scalarUint(conn.Conn, "SELECT @@server_id")
+		conn.Close()
+		if err != nil {
+			continue
+		}
+		reachable++
+		if id > highest {
+			highest = id
+		}
+	}
+	if reachable == 0 {
+		return 0, fmt.Errorf("no node in the cluster could be reached to work out a free server id")
+	}
+	return uint32(highest + 1), nil
 }
 
 // provisionReplica configures one replica to follow the primary.

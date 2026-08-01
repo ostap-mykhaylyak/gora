@@ -24,9 +24,10 @@ type Config struct {
 	Users   []User  `yaml:"users"`
 	Routing Routing `yaml:"routing"`
 
+	Cluster     Cluster     `yaml:"cluster"`
 	Replication Replication `yaml:"replication"`
-	Pool    Pool    `yaml:"pool"`
-	Cache   Cache   `yaml:"cache"`
+	Pool        Pool        `yaml:"pool"`
+	Cache       Cache       `yaml:"cache"`
 
 	Profiling Profiling `yaml:"profiling"`
 	Status    Status    `yaml:"status"`
@@ -108,10 +109,20 @@ type Replication struct {
 	// automatic failover starts. Too short and a network hiccup promotes a
 	// replica; too long and the outage is the delay.
 	FailoverDelay Duration `yaml:"failover_delay"`
-	// StateFile records which node is currently the primary, so a promotion
-	// survives a restart of gora. Without it, gora would come back and try
-	// to write to the node the configuration calls the primary, which by
-	// then is a replica.
+}
+
+// Cluster is what gora remembers about the servers between restarts.
+type Cluster struct {
+	// StateFile records which node is the primary and which nodes have been
+	// added or removed while gora was running. Both are things the
+	// configuration file cannot know: a promotion happens during an
+	// incident, and a node is added on a Tuesday afternoon with customers
+	// on the site.
+	//
+	// It is also how a change made on the command line reaches a running
+	// gora — it re-reads this file — without a control socket that could be
+	// asked to do anything else. Empty keeps the changes in memory, so they
+	// last until the next restart.
 	StateFile string `yaml:"state_file"`
 }
 
@@ -315,11 +326,11 @@ func Default() Config {
 			MaxReplicaLag:    Duration(5 * time.Second),
 			HealthInterval:   Duration(2 * time.Second),
 		},
+		Cluster: Cluster{StateFile: "/var/lib/gora/cluster.json"},
 		Replication: Replication{
 			User:          "gora_repl",
 			Failover:      FailoverManual,
 			FailoverDelay: Duration(30 * time.Second),
-			StateFile:     "/var/lib/gora/cluster.json",
 		},
 		Pool: Pool{
 			MaxOpen:        100,
@@ -516,12 +527,10 @@ func (c *Config) validateBackend() error {
 		if c.Replication.Failover == FailoverAutomatic && c.Replication.FailoverDelay <= 0 {
 			return fmt.Errorf("replication.failover_delay must be > 0 for automatic failover: promoting on the first missed check turns a network hiccup into a promotion")
 		}
-		if c.Replication.StateFile != "" && !strings.HasPrefix(c.Replication.StateFile, "/") {
-			return fmt.Errorf("replication.state_file %q must be an absolute path", c.Replication.StateFile)
-		}
-		if len(c.Backend.Replicas) == 0 {
-			return fmt.Errorf("replication.enabled needs at least one node in backend.replicas")
-		}
+	}
+
+	if c.Cluster.StateFile != "" && !strings.HasPrefix(c.Cluster.StateFile, "/") {
+		return fmt.Errorf("cluster.state_file %q must be an absolute path", c.Cluster.StateFile)
 	}
 
 	if len(c.Users) == 0 {
@@ -607,6 +616,10 @@ func (c *Config) validateCache() error {
 	}
 	return nil
 }
+
+// CheckAddress reports whether a string is a usable host:port, for the
+// addresses that arrive after loading — a node added on the command line.
+func CheckAddress(addr string) error { return validAddress("address", addr) }
 
 // validAddress accepts host:port, including the ":3306" and "0.0.0.0:3306"
 // forms. A bare hostname is the most common mistake, so it gets its own
