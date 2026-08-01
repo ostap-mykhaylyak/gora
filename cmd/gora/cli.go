@@ -25,12 +25,14 @@ Commands (no dashes):
   restart         stop the running instance, then run in the foreground
   reload          make the running instance re-read its configuration (SIGHUP)
   status          print the state of the running instance
+  top             watch what the running instance is doing, refreshed live
 
 Options (always two dashes):
   --config <path> configuration file (default /etc/gora/config.yaml)
   --init          install gora as a systemd service and exit
   --check-config  validate the configuration and exit
   --advice        print what the profiler has suggested, and exit
+  --json          with status: print the raw snapshot instead of a report
   --init-cluster  configure the servers into a replicating cluster and exit
   --promote <addr> make that node the primary and exit
   --version       print the version and exit
@@ -38,7 +40,7 @@ Options (always two dashes):
 `
 
 // commands are the service verbs, in the order they appear in the usage.
-var commands = []string{"start", "stop", "restart", "reload", "status"}
+var commands = []string{"start", "stop", "restart", "reload", "status", "top"}
 
 type options struct {
 	command     string
@@ -48,6 +50,7 @@ type options struct {
 	advice      bool
 	initCluster bool
 	promote     string
+	asJSON      bool
 	version     bool
 	help        bool
 }
@@ -91,6 +94,11 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.advice = true
+			case "json":
+				if err := noValue(name, hasValue); err != nil {
+					return opts, err
+				}
+				opts.asJSON = true
 			case "init-cluster":
 				if err := noValue(name, hasValue); err != nil {
 					return opts, err

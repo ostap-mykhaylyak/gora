@@ -6,10 +6,16 @@ and configured with a single `config.yaml`.
 A *gora* is the channel that carries water to a mill: the queries are the
 water, MySQL is the mill.
 
-> ⚠️ **Early development.** gora proxies traffic, pools connections,
-> multiplexes them, caches WordPress's hottest reads, splits reads from
-> writes across replicas, sets up and governs the replication between them,
-> and can rewrite, refuse, throttle and profile what goes through it.
+gora proxies traffic, pools connections, multiplexes them, caches
+WordPress's hottest reads, splits reads from writes across replicas, sets up
+and governs the replication between them, and can rewrite, refuse, throttle
+and profile what goes through it.
+
+> ⚠️ **Not yet run against a production workload.** The test suite drives a
+> real MySQL protocol implementation, not a mock, and covers the routing,
+> caching and replication decisions described below — but the cluster
+> commands have not been exercised against a real MySQL server pair. Try it
+> somewhere you can afford to be wrong first.
 
 ## Features
 
@@ -153,6 +159,7 @@ gora stop                     # SIGTERM the running instance and wait for it
 gora restart                  # stop, then run in the foreground
 gora reload                   # SIGHUP: re-read the configuration
 gora status                   # print the state of the running instance
+gora top                      # watch what it is doing, refreshed live
 ```
 
 ```sh
@@ -161,6 +168,7 @@ gora --check-config           # validate the configuration and exit
 gora --advice                 # print what the profiler has suggested
 gora --init-cluster           # configure the servers into a replicating cluster
 gora --promote 10.0.0.11:3306 # make that node the primary
+gora status --json            # the raw snapshot, for whatever collects it
 gora --config /etc/gora/config.yaml
 gora --version
 gora --help
@@ -330,6 +338,48 @@ behave the way the numbers suggest. Names must be unique within a section.
 Only cache queries whose answer is the same for every visitor. Never cache
 per-customer data — carts, sessions, orders.
 
+## Operating gora
+
+`gora status` answers *what is the state*. `gora top` answers *what is
+happening*, refreshed every second, which is the question you have during an
+incident:
+
+```sh
+gora top
+```
+
+```
+gora 0.1.0   up 3h12m4s   14:22:07
+------------------------------------------------------------------------
+clients   48 connected, 2 pinned, 3 running
+traffic   612.4 statements/s, 0.0 errors/s (7061233 total, 4 errors)
+cache     71.3% hit ratio, 8842 entries, 41.2 MiB, 436.9 hits/s
+
+NODE                     ROLE     STATE  LAG     CONNECTIONS  READS
+10.0.0.10:3306           primary  up     -       12/100       yes
+10.0.0.11:3306           replica  up     0s      34/100       yes
+10.0.0.12:3306           replica  up     47s     0/100        no
+```
+
+`gora status --json` prints the same snapshot the daemon holds, for whatever
+collects it: the readable report is what is derived, not the other way round.
+
+What to look at, and what it means:
+
+| What you see | What it means |
+|---|---|
+| a replica with `READS no` | it is down, further behind than `max_replica_lag`, or its lag could not be read at all |
+| `LAG ?` | gora could not read the replication status — usually the proxy account is missing `REPLICATION CLIENT` |
+| the primary in state `RO` | it has become read-only. Something failed over without telling gora; writes are being refused |
+| pool waits above zero in `gora status` | `pool.max_open` is too small for the traffic, or statements are holding connections too long |
+| a low cache hit ratio | the ratio only counts cacheable traffic, so a low one means the entries are being invalidated faster than they are used — usually a write-heavy table in an `invalidate_on` list |
+| `REPLICATION STOPPED` | the replica hit an error applying something; `gora status` prints it |
+
+The log is the other half. Every refused statement, throttled statement,
+pinned session and reload is logged with the reason, and with
+`profiling.enabled` the periodic report says which statements the time
+actually went into.
+
 ## Current limitations
 
 - Result sets are buffered in memory while being relayed; a full-table dump
@@ -349,8 +399,8 @@ per-customer data — carts, sessions, orders.
 | ~~M3~~ | traffic | query rewriting, firewall, per-digest throttling |
 | ~~M4~~ | profiling | slow query log, aggregated report, index and rewrite advisor |
 | ~~M5~~ | topology | multiple nodes, health checks, read/write split, degraded mode |
-| **M6** | replication | GTID provisioning, seeding, monitoring, failover |
-| M7 | observability | `gora top`, extended status, documentation |
+| ~~M6~~ | replication | GTID provisioning, seeding, monitoring, failover |
+| ~~M7~~ | observability | `gora top`, extended status, documentation |
 
 ## Development
 

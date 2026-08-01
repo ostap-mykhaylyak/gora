@@ -578,6 +578,7 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		r, err = exec()
 	}
 	s.observeProfile(query, dur, r, !executed, err)
+	s.srv.countStatement(err)
 	if err != nil {
 		return r, err
 	}
@@ -848,6 +849,7 @@ func (s *session) HandleStmtExecute(context any, query string, args []any) (*mys
 	stopWatchdog()
 	s.finish(err)
 	s.observeProfile(query, time.Since(start), r, false, err)
+	s.srv.countStatement(err)
 	if err == nil {
 		kind := statement.Classify(query)
 		s.trackSafety(kind, query, r)

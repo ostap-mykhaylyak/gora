@@ -171,6 +171,53 @@ func TestRunAdvice(t *testing.T) {
 	}
 }
 
+// Every command and option in the usage has to be one parseArgs accepts,
+// or the help is a list of things that do not work.
+func TestUsageMatchesTheParser(t *testing.T) {
+	for _, command := range commands {
+		if !strings.Contains(usage, "  "+command+" ") {
+			t.Errorf("command %q is accepted but not in the usage", command)
+		}
+		if _, err := parseArgs([]string{command}); err != nil {
+			t.Errorf("command %q is in the usage but rejected: %v", command, err)
+		}
+	}
+
+	for _, option := range []string{
+		"--config", "--init", "--check-config", "--advice",
+		"--json", "--init-cluster", "--promote", "--version", "--help",
+	} {
+		if !strings.Contains(usage, option) {
+			t.Errorf("option %q is accepted but not in the usage", option)
+		}
+	}
+}
+
+// The actions are mutually exclusive, and saying which two were given is
+// more use than saying that something was wrong.
+func TestActionsAreExclusive(t *testing.T) {
+	_, err := parseArgs([]string{"--advice", "--init-cluster"})
+	if err == nil {
+		t.Fatal("two actions were accepted together")
+	}
+	if !strings.Contains(err.Error(), "--advice") || !strings.Contains(err.Error(), "--init-cluster") {
+		t.Fatalf("error %q does not name both actions", err)
+	}
+}
+
+func TestPromoteNeedsAnAddress(t *testing.T) {
+	if _, err := parseArgs([]string{"--promote"}); err == nil {
+		t.Fatal("--promote was accepted without an address")
+	}
+	opts, err := parseArgs([]string{"--promote", "10.0.0.11:3306"})
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if opts.promote != "10.0.0.11:3306" {
+		t.Fatalf("promote = %q", opts.promote)
+	}
+}
+
 func TestRunCheckConfigFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "broken.yaml")
 	if err := os.WriteFile(path, []byte("listen:\n  addres: \"0.0.0.0:3306\"\n"), 0o600); err != nil {

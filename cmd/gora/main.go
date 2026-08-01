@@ -71,7 +71,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		case "reload":
 			err = reload(stdout)
 		case "status":
-			err = printStatus(opts.configPath, stdout)
+			err = printStatus(opts.configPath, opts.asJSON, stdout)
+		case "top":
+			err = top(opts.configPath, stdout)
 		default:
 			// No command and no action: the user is looking around.
 			fmt.Fprint(stdout, usage)

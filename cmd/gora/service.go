@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -330,7 +331,7 @@ func reload(stdout io.Writer) error {
 }
 
 // printStatus queries the running instance through its status socket.
-func printStatus(configPath string, stdout io.Writer) error {
+func printStatus(configPath string, asJSON bool, stdout io.Writer) error {
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
@@ -342,6 +343,14 @@ func printStatus(configPath string, stdout io.Writer) error {
 	snap, err := status.Query(cfg.Status.Socket)
 	if err != nil {
 		return fmt.Errorf("is gora running? %w", err)
+	}
+
+	// The same snapshot the daemon holds, for whatever collects it. It is
+	// the readable report that is derived, not the other way round.
+	if asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(snap)
 	}
 
 	fmt.Fprintf(stdout, "gora %s, pid %d, up %s\n", snap.Version, snap.PID, snap.Uptime())

@@ -74,6 +74,11 @@ type Server struct {
 	numClients atomic.Int64
 	numPinned  atomic.Int64
 	numActive  atomic.Int64 // statements currently executing
+
+	// Totals since startup. They are what a live view turns into rates:
+	// a number per second is the only form in which "busy" means anything.
+	numStatements atomic.Uint64
+	numErrors     atomic.Uint64
 }
 
 // New creates a Server; call Run to start serving.
@@ -119,14 +124,27 @@ type Stats struct {
 	Clients int64 `json:"clients"`
 	Pinned  int64 `json:"pinned_sessions"`
 	Active  int64 `json:"active_statements"`
+	// Statements and Errors are totals since startup.
+	Statements uint64 `json:"statements"`
+	Errors     uint64 `json:"errors"`
 }
 
 // Stat returns the current client-side state.
 func (s *Server) Stat() Stats {
 	return Stats{
-		Clients: s.numClients.Load(),
-		Pinned:  s.numPinned.Load(),
-		Active:  s.numActive.Load(),
+		Clients:    s.numClients.Load(),
+		Pinned:     s.numPinned.Load(),
+		Active:     s.numActive.Load(),
+		Statements: s.numStatements.Load(),
+		Errors:     s.numErrors.Load(),
+	}
+}
+
+// countStatement records one statement handled, however it ended.
+func (s *Server) countStatement(err error) {
+	s.numStatements.Add(1)
+	if err != nil {
+		s.numErrors.Add(1)
 	}
 }
 
