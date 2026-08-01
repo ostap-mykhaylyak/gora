@@ -46,6 +46,11 @@ type Conn struct {
 	// ThreadID is MySQL's connection id, used by KILL QUERY.
 	ThreadID uint32
 
+	// owner is the pool this connection must go back to. A session can move
+	// between nodes, so the pool that handed a connection out is no longer
+	// necessarily the one the session is using now.
+	owner *Pool
+
 	createdAt time.Time // when it was dialed, for max_lifetime
 	pooledAt  time.Time // when it was last parked, for idle_timeout
 	lastPing  time.Time // last successful COM_PING or command
@@ -325,11 +330,16 @@ func (p *Pool) dial(ctx context.Context) (*Conn, error) {
 	return &Conn{
 		Conn:      c,
 		ThreadID:  c.GetConnectionID(),
+		owner:     p,
 		createdAt: now,
 		pooledAt:  now,
 		lastPing:  now,
 	}, nil
 }
+
+// Owner returns the pool the connection belongs to, so a caller holding one
+// can return it without having to remember where it came from.
+func (c *Conn) Owner() *Pool { return c.owner }
 
 func (p *Pool) dialOptions() []client.Option {
 	if p.tlsConf == nil {

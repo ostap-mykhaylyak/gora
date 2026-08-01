@@ -21,6 +21,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
+	"github.com/ostap-mykhaylyak/gora/internal/topology"
 )
 
 // Snapshot is the state of a running instance. It grows with every
@@ -34,12 +35,13 @@ type Snapshot struct {
 	Listen        string `json:"listen"`
 	Backend       string `json:"backend"`
 
-	Clients  proxy.Stats    `json:"clients"`
-	Pool     pool.Stats     `json:"pool"`
-	Cache    *cache.Report  `json:"cache,omitempty"`
-	Firewall firewall.Stats `json:"firewall"`
-	Throttle throttle.Stats `json:"throttle"`
-	Rewrites int            `json:"rewrite_rules"`
+	Clients  proxy.Stats          `json:"clients"`
+	Nodes    []topology.NodeStats `json:"nodes"`
+	Pool     pool.Stats           `json:"pool"`
+	Cache    *cache.Report        `json:"cache,omitempty"`
+	Firewall firewall.Stats       `json:"firewall"`
+	Throttle throttle.Stats       `json:"throttle"`
+	Rewrites int                  `json:"rewrite_rules"`
 }
 
 // Uptime returns the uptime as a duration.

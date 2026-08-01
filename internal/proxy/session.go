@@ -20,6 +20,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/statement"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
+	"github.com/ostap-mykhaylyak/gora/internal/topology"
 )
 
 // maxTrackedSets caps the SET statements replayed on connection reuse.
@@ -49,8 +50,9 @@ const maxTrackedTxWrites = 128
 type session struct {
 	ctx      context.Context
 	srv      *Server
-	pool     *pool.Pool
+	topo     *topology.Topology
 	cfg      config.Pool
+	routing  config.Routing
 	cache    *cache.Cache // nil when the cache is disabled
 	rewriter *rewrite.Rewriter
 	firewall *firewall.Firewall
@@ -58,10 +60,16 @@ type session struct {
 	prof     *profile.Profiler // nil when profiling is off
 	log      *slog.Logger
 
-	mu      sync.Mutex // guards everything below, including against the pinger
-	conn    *pool.Conn
+	mu   sync.Mutex // guards everything below, including against the pinger
+	conn *pool.Conn
+	// node is where conn came from. A session can move between nodes, but
+	// only while it is holding nothing that would have to move with it.
+	node    *topology.Node
 	db      string
 	lastUse time.Time
+	// lastWrite arms the sticky window: after writing, this session's own
+	// reads stay on the primary long enough for replication to catch up.
+	lastWrite time.Time
 
 	// authenticated flips once the handshake has succeeded. The protocol
 	// library calls UseDB while it is still parsing the handshake response,
@@ -95,8 +103,9 @@ func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 	s := &session{
 		ctx:      ctx,
 		srv:      srv,
-		pool:     srv.pool,
+		topo:     srv.topo,
 		cfg:      srv.cfg,
+		routing:  srv.routing,
 		cache:    srv.cache,
 		rewriter: srv.rewriter,
 		firewall: srv.firewall,
@@ -120,7 +129,7 @@ func (s *session) close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.conn != nil {
-		s.pool.Release(s.conn)
+		s.node.Pool().Release(s.conn)
 		s.conn = nil
 	}
 	if s.pinned {
@@ -129,36 +138,117 @@ func (s *session) close() {
 	}
 }
 
-// backend returns the attached connection, acquiring and preparing one when
-// the session has none. Must be called with s.mu held.
-func (s *session) backend() (*pool.Conn, error) {
+// backend returns a connection for a statement of this kind, moving the
+// session to another node when routing calls for it. Must be called with
+// s.mu held.
+func (s *session) backend(kind statement.Kind) (*pool.Conn, error) {
+	want, err := s.route(kind)
+	if err != nil {
+		return nil, err
+	}
+
 	if s.conn != nil {
-		return s.conn, nil
+		if s.node == want {
+			return s.conn, nil
+		}
+		// The statement belongs elsewhere and the session is free to move:
+		// park this connection before taking one from the other node.
+		c := s.conn
+		s.conn, s.node = nil, nil
+		c.Owner().ReleaseClean(c)
 	}
 
 	// Two attempts: a parked connection can fail preparation because it died
 	// while parked, and a freshly dialed one deserves the second try.
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		c, err := s.pool.Acquire(s.ctx)
+		c, err := want.Pool().Acquire(s.ctx)
 		if err != nil {
-			return nil, err
+			return nil, backendError(want, err)
 		}
 		if err := s.prepareConn(c); err != nil {
 			lastErr = err
 			if isConnError(err) {
-				s.pool.Discard(c)
+				want.Pool().Discard(c)
 				continue
 			}
 			// A MySQL-level error (unknown database, denied access): the
 			// connection is fine, the request is not.
-			s.pool.Release(c)
+			want.Pool().Release(c)
 			return nil, err
 		}
-		s.conn = c
+		s.conn, s.node = c, want
 		return c, nil
 	}
 	return nil, lastErr
+}
+
+// route decides which node a statement of this kind belongs on.
+//
+// A session holding anything — an open transaction, a temporary table, a
+// statement whose companion reads a counter off the connection — does not
+// move: that state lives on one connection on one server, and following it
+// around is the reason multiplexing has safety rules at all.
+func (s *session) route(kind statement.Kind) (*topology.Node, error) {
+	if s.conn != nil && (!s.releasable() || s.holdNext) {
+		return s.node, nil
+	}
+
+	if writeBound(kind) || s.inTx {
+		if !s.topo.WritesAccepted() {
+			return nil, errWritesRefused
+		}
+		return s.topo.Primary(), nil
+	}
+
+	switch kind {
+	case statement.KindSelect, statement.KindOther:
+		if s.stickyActive() {
+			// This session has just written. Replication is asynchronous,
+			// so for a moment the only server that certainly has its data
+			// is the one it wrote to.
+			return s.topo.Primary(), nil
+		}
+		return s.topo.PickReader(), nil
+	default:
+		return s.topo.Primary(), nil
+	}
+}
+
+// writeBound reports whether a statement must run on the primary.
+func writeBound(kind statement.Kind) bool {
+	switch kind {
+	case statement.KindWrite, statement.KindBegin, statement.KindCommit,
+		statement.KindRollback, statement.KindUnsafe:
+		return true
+	default:
+		return false
+	}
+}
+
+// stickyActive reports whether this session's reads are still tied to the
+// primary after a write of its own.
+func (s *session) stickyActive() bool {
+	if !s.topo.HasReplicas() || s.routing.StickyAfterWrite <= 0 || s.lastWrite.IsZero() {
+		return false
+	}
+	return time.Since(s.lastWrite) < s.routing.StickyAfterWrite.Std()
+}
+
+// errWritesRefused is what a client is told when the primary cannot take
+// writes. It carries the error code MySQL itself uses for a read-only
+// server, so clients recognise it instead of seeing a proxy failure.
+var errWritesRefused = mysql.NewError(mysql.ER_OPTION_PREVENTS_STATEMENT,
+	"gora: the primary database is not accepting writes right now")
+
+// backendError turns a pool failure into something a client can read: a
+// backend that is down is a database error, not a proxy stack trace.
+func backendError(n *topology.Node, err error) error {
+	if errors.Is(err, pool.ErrBackendDown) {
+		return mysql.NewError(mysql.ER_UNKNOWN_ERROR,
+			"gora: database node "+n.Address+" is unreachable")
+	}
+	return err
 }
 
 // prepareConn aligns a pooled connection with this session's environment:
@@ -169,7 +259,7 @@ func (s *session) backend() (*pool.Conn, error) {
 func (s *session) prepareConn(c *pool.Conn) error {
 	if c.VarSig != s.varSig && c.VarSig != "" {
 		// The connection carries another session's variables.
-		if err := s.pool.ResetConn(c); err != nil {
+		if err := c.Owner().ResetConn(c); err != nil {
 			return err
 		}
 	}
@@ -195,15 +285,7 @@ func (s *session) prepareConn(c *pool.Conn) error {
 // read: results are buffered, so replying to the client does not need the
 // backend connection any more.
 func (s *session) maybeRelease() {
-	if !s.mux || s.conn == nil {
-		return
-	}
-	if s.pinned || s.inTx || s.openStmts > 0 {
-		return
-	}
-	// The status flags of the last OK/EOF packet catch implicit transactions
-	// (autocommit=0) that keyword tracking alone would miss.
-	if s.conn.IsInTransaction() || !s.conn.IsAutoCommit() {
+	if !s.mux || s.conn == nil || !s.releasable() {
 		return
 	}
 	if s.holdNext {
@@ -211,8 +293,23 @@ func (s *session) maybeRelease() {
 		return
 	}
 	c := s.conn
-	s.conn = nil
-	s.pool.ReleaseClean(c)
+	s.conn, s.node = nil, nil
+	c.Owner().ReleaseClean(c)
+}
+
+// releasable reports whether the session is holding nothing that lives on
+// its current connection. Both letting go of a connection and moving to
+// another node depend on it. Must be called with s.mu held.
+func (s *session) releasable() bool {
+	if s.pinned || s.inTx || s.openStmts > 0 {
+		return false
+	}
+	if s.conn == nil {
+		return true
+	}
+	// The status flags of the last OK/EOF packet catch implicit transactions
+	// (autocommit=0) that keyword tracking alone would miss.
+	return !s.conn.IsInTransaction() && s.conn.IsAutoCommit()
 }
 
 // pin ties the session to its connection for the rest of its life.
@@ -234,6 +331,11 @@ func (s *session) trackSafety(kind statement.Kind, query string, r *mysql.Result
 		s.inTx = true
 	case statement.KindCommit, statement.KindRollback:
 		s.inTx = false
+		s.lastWrite = time.Now()
+	case statement.KindWrite:
+		// The sticky window starts here: this session's own reads stay on
+		// the primary until replication has plausibly caught up.
+		s.lastWrite = time.Now()
 	case statement.KindUnsafe:
 		s.pin("untracked session command (autocommit/XA)")
 	}
@@ -295,8 +397,8 @@ func (s *session) finish(err error) {
 	}
 	if isConnError(err) {
 		s.log.Warn("backend connection lost, will reattach on the next command", "error", err)
-		s.pool.Discard(s.conn)
-		s.conn = nil
+		s.node.Pool().Discard(s.conn)
+		s.conn, s.node = nil, nil
 	}
 }
 
@@ -315,11 +417,12 @@ func (s *session) queryWatchdog(c *pool.Conn, query string) func() {
 		return func() {}
 	}
 	threadID := c.ThreadID
+	owner := c.Owner()
 	limit := s.cfg.MaxQueryTime.Std()
 	timer := time.AfterFunc(limit, func() {
 		s.log.Warn("statement exceeded max_query_time, killing it",
 			"max_query_time", limit, "query", query)
-		if err := s.pool.KillQuery(threadID); err != nil {
+		if err := owner.KillQuery(threadID); err != nil {
 			s.log.Error("could not kill the runaway statement", "error", err)
 		}
 	})
@@ -345,8 +448,8 @@ func (s *session) pinger() {
 		if s.conn != nil && time.Since(s.lastUse) >= s.cfg.PingInterval.Std() {
 			if err := s.conn.Ping(); err != nil {
 				s.log.Warn("keepalive ping failed, dropping the backend connection", "error", err)
-				s.pool.Discard(s.conn)
-				s.conn = nil
+				s.node.Pool().Discard(s.conn)
+				s.conn, s.node = nil, nil
 			} else {
 				s.lastUse = time.Now()
 			}
@@ -384,7 +487,7 @@ func (s *session) UseDB(dbName string) error {
 	if s.conn == nil {
 		// COM_INIT_DB: the client is waiting for a verdict on this database
 		// name, so it is checked against the backend right away.
-		if _, err := s.backend(); err != nil {
+		if _, err := s.backend(statement.KindOther); err != nil {
 			return err
 		}
 		s.maybeRelease()
@@ -447,7 +550,7 @@ func (s *session) HandleQuery(query string) (*mysql.Result, error) {
 		}
 		defer release()
 
-		c, err := s.backend()
+		c, err := s.backend(kind)
 		if err != nil {
 			return nil, err
 		}
@@ -563,7 +666,7 @@ func (s *session) handleListing(query string) (*mysql.Result, error) {
 	}
 	defer release()
 
-	c, err := s.backend()
+	c, err := s.backend(statement.KindSelect)
 	if err != nil {
 		return nil, err
 	}
@@ -599,7 +702,7 @@ func (s *session) serveFoundRows(query string) (*mysql.Result, error) {
 		return r, nil
 	}
 
-	c, err := s.backend()
+	c, err := s.backend(statement.KindSelect)
 	if err != nil {
 		return nil, err
 	}
@@ -674,7 +777,7 @@ func (s *session) HandleFieldList(table string, fieldWildcard string) ([]*mysql.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	c, err := s.backend()
+	c, err := s.backend(statement.KindOther)
 	if err != nil {
 		return nil, err
 	}
@@ -702,7 +805,10 @@ func (s *session) HandleStmtPrepare(query string) (int, int, any, error) {
 		return 0, 0, nil, err
 	}
 
-	c, err := s.backend()
+	// A prepared statement lives on one connection on one server, and its
+	// text is only classified when it is executed: it goes to the primary,
+	// where a write is allowed to be.
+	c, err := s.backend(statement.KindWrite)
 	if err != nil {
 		return 0, 0, nil, err
 	}
@@ -795,8 +901,8 @@ func (s *session) HandleOtherCommand(cmd byte, data []byte) error {
 		if s.conn != nil {
 			// Release resets the connection on the way to the pool, which is
 			// precisely the semantics the client asked for.
-			s.pool.Release(s.conn)
-			s.conn = nil
+			s.node.Pool().Release(s.conn)
+			s.conn, s.node = nil, nil
 		}
 		s.resetState()
 		return nil

@@ -21,10 +21,10 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/cache"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/firewall"
-	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/profile"
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
+	"github.com/ostap-mykhaylyak/gora/internal/topology"
 )
 
 // Options wires the Server's collaborators. Everything but the pool is
@@ -33,7 +33,8 @@ type Options struct {
 	Listen   config.Listen
 	Users    []config.User
 	PoolCfg  config.Pool
-	Pool     *pool.Pool
+	Routing  config.Routing
+	Topology *topology.Topology
 	Cache    *cache.Cache // nil disables the query cache
 	Rewriter *rewrite.Rewriter
 	Firewall *firewall.Firewall
@@ -48,8 +49,9 @@ type Server struct {
 	addr       string
 	maxClients int
 	drain      time.Duration
-	pool       *pool.Pool
+	topo       *topology.Topology
 	cfg        config.Pool
+	routing    config.Routing
 	cache      *cache.Cache
 	rewriter   *rewrite.Rewriter
 	firewall   *firewall.Firewall
@@ -91,8 +93,9 @@ func New(o Options) *Server {
 		addr:       o.Listen.Address,
 		maxClients: o.Listen.MaxConnections,
 		drain:      o.Listen.DrainTimeout.Std(),
-		pool:       o.Pool,
+		topo:       o.Topology,
 		cfg:        o.PoolCfg,
+		routing:    o.Routing,
 		cache:      o.Cache,
 		rewriter:   o.Rewriter,
 		firewall:   o.Firewall,

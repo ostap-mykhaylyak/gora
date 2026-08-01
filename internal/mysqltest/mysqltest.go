@@ -179,6 +179,14 @@ func (h *handler) HandleQuery(query string) (*mysql.Result, error) {
 	case strings.HasPrefix(upper, "KILL QUERY"):
 		h.srv.Kills.Add(1)
 		return okResult(), nil
+	case strings.Contains(upper, "@@GLOBAL.READ_ONLY"):
+		// A fake primary: writable, like the health check expects to find.
+		// A test wanting a read-only server overrides this with Answer.
+		rs, err := mysql.BuildSimpleTextResultset([]string{"@@global.read_only"}, [][]any{{int64(0)}})
+		if err != nil {
+			return nil, err
+		}
+		return mysql.NewResult(rs), nil
 	case strings.Contains(upper, "INFORMATION_SCHEMA.TABLES"):
 		// The schema lookup gora uses to discover the WordPress table
 		// prefix. Answering it makes that path testable.

@@ -17,9 +17,14 @@ listen:
   #   key: /etc/gora/server.key
 
 backend:
-  # The MySQL server gora forwards to. Backend connections belong to gora
-  # and are shared by every client session.
+  # The primary: the node that takes the writes. With no replicas below,
+  # this is simply "the database". Backend connections belong to gora and
+  # are shared by every client session.
   address: "10.0.0.10:3306"
+  # Read replicas. Leave empty for a single-server installation; list them
+  # and gora sends the reads there and the writes to the primary.
+  replicas: []
+  # The same credentials are used for every node.
   username: "wordpress"
   password: "change-me"
   # How long a single connection attempt may take.
@@ -39,8 +44,20 @@ backend:
 #   - username: "wordpress"
 #     password: "proxy-only-password"
 
+routing:
+  # After a session writes, its own reads stay on the primary for this long.
+  # Replication is asynchronous: without it a shop that has just saved an
+  # order reads back the state from before it. Only matters with replicas.
+  sticky_after_write: 3s
+  # Take a replica out of the read rotation while it is further behind than
+  # this (0 disables the check). A replica whose lag gora cannot read is
+  # also left out: it might be a day behind.
+  max_replica_lag: 5s
+  # How often each node is checked: reachable, read-only, how far behind.
+  health_interval: 2s
+
 pool:
-  # Cap on backend connections (in use + idle).
+  # Cap on backend connections (in use + idle). Applies per node.
   max_open: 100
   # Connections kept parked for reuse.
   max_idle: 10

@@ -34,7 +34,8 @@ func TestServeAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if snap != want {
+	if snap.Version != want.Version || snap.PID != want.PID ||
+		snap.UptimeSeconds != want.UptimeSeconds || snap.Listen != want.Listen {
 		t.Fatalf("snapshot = %+v, want %+v", snap, want)
 	}
 

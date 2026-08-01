@@ -22,6 +22,7 @@ type Config struct {
 	Listen  Listen  `yaml:"listen"`
 	Backend Backend `yaml:"backend"`
 	Users   []User  `yaml:"users"`
+	Routing Routing `yaml:"routing"`
 	Pool    Pool    `yaml:"pool"`
 	Cache   Cache   `yaml:"cache"`
 
@@ -54,16 +55,37 @@ type ListenTLS struct {
 // Enabled reports whether client-facing TLS is configured.
 func (t ListenTLS) Enabled() bool { return t.Cert != "" || t.Key != "" }
 
-// Backend is the MySQL server gora forwards to. Username and password are
-// gora's own credentials: backend connections belong to gora, not to the
-// clients that authenticate against it.
+// Backend is the MySQL side. Username and password are gora's own
+// credentials: backend connections belong to gora, not to the clients that
+// authenticate against it, and every node is reached with the same ones.
 type Backend struct {
-	Address  string `yaml:"address"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
-	// ConnectTimeout bounds a single dial to the backend.
+	// Address is the primary: the node that takes the writes. With no
+	// replicas configured it is simply "the database".
+	Address string `yaml:"address"`
+	// Replicas take the reads. Empty means everything goes to the primary,
+	// which is the single-server installation.
+	Replicas []string `yaml:"replicas"`
+	Username string   `yaml:"username"`
+	Password string   `yaml:"password"`
+	// ConnectTimeout bounds a single dial to a node.
 	ConnectTimeout Duration   `yaml:"connect_timeout"`
 	TLS            BackendTLS `yaml:"tls"`
+}
+
+// Routing decides which node a statement goes to.
+type Routing struct {
+	// StickyAfterWrite keeps a session's reads on the primary for this long
+	// after it has written. Replication is asynchronous: without this, a
+	// shop that has just saved an order reads back the state before it, and
+	// the customer sees an empty basket. Zero sends reads to replicas
+	// immediately, which is only safe if nothing reads what it just wrote.
+	StickyAfterWrite Duration `yaml:"sticky_after_write"`
+	// MaxReplicaLag takes a replica out of the read rotation while it is
+	// further behind than this (0 = do not check). A replica an hour behind
+	// is not a replica, it is a backup.
+	MaxReplicaLag Duration `yaml:"max_replica_lag"`
+	// HealthInterval is how often each node is checked.
+	HealthInterval Duration `yaml:"health_interval"`
 }
 
 // BackendTLS encrypts connections toward MySQL.
@@ -245,6 +267,11 @@ func Default() Config {
 		Backend: Backend{
 			ConnectTimeout: Duration(5 * time.Second),
 		},
+		Routing: Routing{
+			StickyAfterWrite: Duration(3 * time.Second),
+			MaxReplicaLag:    Duration(5 * time.Second),
+			HealthInterval:   Duration(2 * time.Second),
+		},
 		Pool: Pool{
 			MaxOpen:        100,
 			MaxIdle:        10,
@@ -397,6 +424,28 @@ func (c *Config) validateBackend() error {
 	}
 	if !c.Backend.TLS.Enabled && (c.Backend.TLS.CA != "" || c.Backend.TLS.SkipVerify) {
 		return fmt.Errorf("backend.tls is configured but backend.tls.enabled is false")
+	}
+
+	seen := map[string]bool{c.Backend.Address: true}
+	for i, replica := range c.Backend.Replicas {
+		field := fmt.Sprintf("backend.replicas[%d]", i)
+		if err := validAddress(field, replica); err != nil {
+			return err
+		}
+		if seen[replica] {
+			return fmt.Errorf("%s %q is listed twice, or is the primary", field, replica)
+		}
+		seen[replica] = true
+	}
+
+	if c.Routing.StickyAfterWrite < 0 {
+		return fmt.Errorf("routing.sticky_after_write must be >= 0")
+	}
+	if c.Routing.MaxReplicaLag < 0 {
+		return fmt.Errorf("routing.max_replica_lag must be >= 0 (0 disables the check)")
+	}
+	if c.Routing.HealthInterval <= 0 {
+		return fmt.Errorf("routing.health_interval must be > 0")
 	}
 
 	if len(c.Users) == 0 {

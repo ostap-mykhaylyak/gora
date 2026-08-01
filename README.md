@@ -7,9 +7,10 @@ A *gora* is the channel that carries water to a mill: the queries are the
 water, MySQL is the mill.
 
 > ⚠️ **Early development.** gora proxies traffic, pools connections,
-> multiplexes them, caches WordPress's hottest reads, and can rewrite,
-> refuse, throttle and profile what goes through it. The read/write split
-> and the replication manager are still to come — see the roadmap.
+> multiplexes them, caches WordPress's hottest reads, splits reads from
+> writes across replicas, and can rewrite, refuse, throttle and profile what
+> goes through it. The replication manager is still to come — see the
+> roadmap.
 
 ## Features
 
@@ -83,6 +84,23 @@ water, MySQL is the mill.
   statement shape — literals are normalised away — so one runaway query is
   held back without touching everything else the rule matches. A cache hit
   costs the database nothing and never needs a slot.
+- **Read/write split** — list `backend.replicas` and reads go to them while
+  writes go to the primary. After a session writes, its own reads stay on
+  the primary for `routing.sticky_after_write`: replication is asynchronous,
+  and a shop that has just saved an order must not read back the state from
+  before it. Everything inside a transaction stays on the primary, because a
+  read there is reading uncommitted state that exists nowhere else.
+- **Health checks** — every node is asked, on `routing.health_interval`,
+  whether it is reachable, whether it is read-only, and how far behind it
+  is. A replica beyond `routing.max_replica_lag` leaves the read rotation,
+  and so does one whose lag gora cannot read at all: a replica that might be
+  a day behind is not a replica, it is a backup.
+- **Degraded mode** — with the primary unreachable the site does not stop.
+  Reads keep coming from the replicas and the cache; writes are refused with
+  the error code MySQL itself uses for a read-only server, so the client
+  sees a database saying no rather than a connection timing out. A primary
+  that has quietly become read-only — a failover nobody told gora about —
+  is treated the same way.
 - **Circuit breaker** — when MySQL is down, waiting for per-request timeouts
   melts PHP-FPM. After `pool.breaker.failures` consecutive failures gora
   fails fast with a clean error and probes the backend until it recovers.
@@ -103,9 +121,10 @@ water, MySQL is the mill.
   connections. Idle sessions are not waited for.
 - **TLS** — `listen.tls` encrypts client connections, `backend.tls` encrypts
   the connection toward a remote MySQL, with an optional custom CA.
-- **`gora status`** — a read-only unix socket exposes live state: connected
-  clients, pinned sessions, statements running, pool occupancy, breaker
-  state, and how often clients had to wait for a connection.
+- **`gora status`** — a read-only unix socket exposes live state: every
+  node with its role, health, lag and pool occupancy; connected clients,
+  pinned sessions, statements running, cache hit ratios, and how often
+  clients had to wait for a connection.
 
 ## Command line
 
@@ -167,10 +186,16 @@ listen:
   drain_timeout: 10s
 
 backend:
-  address: "10.0.0.10:3306"  # the MySQL server gora forwards to
+  address: "10.0.0.10:3306"  # the primary: where the writes go
+  replicas: []               # read replicas; empty is a single server
   username: "wordpress"
   password: "change-me"
   connect_timeout: 5s
+
+routing:
+  sticky_after_write: 3s     # a session reads its own writes from the primary
+  max_replica_lag: 5s        # a replica further behind stops serving reads
+  health_interval: 2s
 
 pool:
   max_open: 100
@@ -294,8 +319,8 @@ per-customer data — carts, sessions, orders.
 | ~~M1~~ | data plane | MySQL protocol, connection pool, keepalive, per-query multiplexing, TLS |
 | ~~M2~~ | cache | WordPress-aware query cache, conf.d rules, hot reload, warm-up |
 | ~~M3~~ | traffic | query rewriting, firewall, per-digest throttling |
-| **M4** | profiling | slow query log, aggregated report, index and rewrite advisor |
-| M5 | topology | multiple nodes, health checks, read/write split, degraded mode |
+| ~~M4~~ | profiling | slow query log, aggregated report, index and rewrite advisor |
+| **M5** | topology | multiple nodes, health checks, read/write split, degraded mode |
 | M6 | replication | GTID provisioning, seeding, monitoring, failover |
 | M7 | observability | `gora top`, extended status, documentation |
 

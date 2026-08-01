@@ -18,12 +18,12 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/confd"
 	"github.com/ostap-mykhaylyak/gora/internal/config"
 	"github.com/ostap-mykhaylyak/gora/internal/firewall"
-	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/profile"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/status"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
+	"github.com/ostap-mykhaylyak/gora/internal/topology"
 )
 
 // stopTimeout bounds how long `gora stop` waits for the process to go away
@@ -77,11 +77,24 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		"version", version, "pid", os.Getpid(), "config", configPath,
 		"listen", cfg.Listen.Address, "backend", cfg.Backend.Address)
 
-	backendPool, err := pool.New(cfg.Backend, cfg.Pool, log, nil)
+	topo, err := topology.New(cfg.Backend, cfg.Pool, cfg.Routing, log)
 	if err != nil {
 		return err
 	}
-	defer backendPool.Close()
+	defer topo.Close()
+	go topo.Run(ctx)
+	if topo.HasReplicas() {
+		log.Info("read/write split enabled",
+			"primary", cfg.Backend.Address, "replicas", len(cfg.Backend.Replicas),
+			"sticky_after_write", cfg.Routing.StickyAfterWrite,
+			"max_replica_lag", cfg.Routing.MaxReplicaLag)
+	}
+
+	// Everything gora does on its own behalf goes to the primary. The cache
+	// warm-up in particular must: it refetches right after a write, and a
+	// replica that has not received it yet would put the state from before
+	// the write into the cache.
+	backendPool := topo.Primary().Pool()
 
 	rulesDir := rulesDirFor(cfg, configPath)
 	rules, err := confd.Load(rulesDir)
@@ -134,7 +147,8 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		Listen:   cfg.Listen,
 		Users:    cfg.Users,
 		PoolCfg:  cfg.Pool,
-		Pool:     backendPool,
+		Routing:  cfg.Routing,
+		Topology: topo,
 		Cache:    queryCache,
 		Rewriter: traffic.rewriter,
 		Firewall: traffic.firewall,
@@ -155,6 +169,7 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 				Backend:       cfg.Backend.Address,
 				Clients:       srv.Stat(),
 				Pool:          backendPool.Stat(),
+				Nodes:         topo.Stat(),
 				Firewall:      traffic.firewall.Stat(),
 				Throttle:      traffic.throttle.Stat(),
 				Rewrites:      traffic.rewriter.Len(),
@@ -318,14 +333,34 @@ func printStatus(configPath string, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "clients:  %d connected, %d pinned, %d statements running\n",
 		snap.Clients.Clients, snap.Clients.Pinned, snap.Clients.Active)
 
-	breaker := "closed (backend healthy)"
-	if snap.Pool.BreakerOpen {
-		breaker = "OPEN (backend unreachable)"
+	for _, n := range snap.Nodes {
+		state := "up"
+		if !n.Up {
+			state = "DOWN"
+		}
+		if n.ReadOnly {
+			state += ", read-only"
+		}
+		if n.Role == topology.RoleReplica {
+			if n.LagSeconds < 0 {
+				state += ", lag unknown"
+			} else {
+				state += fmt.Sprintf(", lag %ds", n.LagSeconds)
+			}
+			if !n.Eligible {
+				state += ", NOT serving reads"
+			}
+		}
+		fmt.Fprintf(stdout, "%-9s %s (%s)\n", string(n.Role)+":", n.Address, state)
+		fmt.Fprintf(stdout, "          %d/%d connections open, %d idle, %d dials, %d retired\n",
+			n.Pool.Open, n.Pool.MaxOpen, n.Pool.Idle, n.Pool.Dials, n.Pool.Retired)
+		if n.Pool.BreakerOpen {
+			fmt.Fprintln(stdout, "          circuit breaker OPEN")
+		}
+		if n.LastError != "" {
+			fmt.Fprintf(stdout, "          last error: %s\n", n.LastError)
+		}
 	}
-	fmt.Fprintf(stdout, "backend:  %s, %d/%d connections open, %d idle, breaker %s\n",
-		snap.Backend, snap.Pool.Open, snap.Pool.MaxOpen, snap.Pool.Idle, breaker)
-	fmt.Fprintf(stdout, "pool:     %d dials, %d closed, %d retired\n",
-		snap.Pool.Dials, snap.Pool.Discards, snap.Pool.Retired)
 	// Waits are the number that says max_open is too small; without them the
 	// average is noise, so it is only printed when there were any.
 	if snap.Pool.Waits > 0 {
@@ -429,7 +464,14 @@ func checkConfig(configPath string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, " (max %d clients)", cfg.Listen.MaxConnections)
 	}
 	fmt.Fprintln(stdout)
-	fmt.Fprintf(stdout, "  backend:  %s as %s\n", cfg.Backend.Address, cfg.Backend.Username)
+	fmt.Fprintf(stdout, "  primary:  %s as %s\n", cfg.Backend.Address, cfg.Backend.Username)
+	for _, replica := range cfg.Backend.Replicas {
+		fmt.Fprintf(stdout, "  replica:  %s\n", replica)
+	}
+	if len(cfg.Backend.Replicas) > 0 {
+		fmt.Fprintf(stdout, "  routing:  reads on replicas, sticky %s after a write, max lag %s\n",
+			cfg.Routing.StickyAfterWrite, cfg.Routing.MaxReplicaLag)
+	}
 	fmt.Fprintf(stdout, "  clients:  %d account(s) authenticate against gora\n", len(cfg.Users))
 	multiplexing := "off (one backend connection per session)"
 	if cfg.Pool.Multiplexing {

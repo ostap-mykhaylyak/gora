@@ -17,6 +17,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
+	"github.com/ostap-mykhaylyak/gora/internal/topology"
 )
 
 const (
@@ -36,45 +37,77 @@ func poolConfig() config.Pool {
 	}
 }
 
-// setup describes the assembly a test wants in front of the fake backend.
-// The zero value is a bare proxy: no cache, no traffic rules.
+// setup describes the assembly a test wants in front of the fake backends.
+// The zero value is a bare proxy on one node: no replicas, no cache, no
+// traffic rules.
 type setup struct {
 	listen    config.Listen
 	pool      config.Pool
+	routing   config.Routing
 	cache     *config.Cache
 	rules     []cache.Rule
 	rewrites  []rewrite.Rule
 	blocks    []firewall.Rule
 	throttles []throttle.Rule
+
+	// replicas is how many read replicas to run behind the proxy, and
+	// primaryDown makes the primary a dead address, which is how the
+	// degraded path is exercised.
+	replicas    int
+	primaryDown bool
+
+	// health runs the health check loop. It is off unless a test needs it,
+	// because it opens connections of its own and the tests that count
+	// connections are counting the client's.
+	health bool
+
+	// Filled in by startWith.
+	replicaServers []*mysqltest.Server
 }
 
 // start runs a fake backend and a bare proxy in front of it.
 func start(t *testing.T, listen config.Listen, poolCfg config.Pool) (*mysqltest.Server, *Server) {
-	return startWith(t, setup{listen: listen, pool: poolCfg})
+	return startWith(t, &setup{listen: listen, pool: poolCfg})
 }
 
-// startWith runs a fake backend and the proxy the setup describes.
-func startWith(t *testing.T, s setup) (*mysqltest.Server, *Server) {
+// startWith runs the fake backends and the proxy the setup describes, and
+// returns the primary backend and the proxy.
+func startWith(t *testing.T, s *setup) (*mysqltest.Server, *Server) {
 	t.Helper()
-	listen, poolCfg, cacheCfg, rules := s.listen, s.pool, s.cache, s.rules
 
 	backend := mysqltest.Start(t, backendUser, backendPass)
 	log := slog.New(slog.DiscardHandler)
 
-	p, err := pool.New(config.Backend{
-		Address:        backend.Addr,
+	primaryAddr := backend.Addr
+	if s.primaryDown {
+		primaryAddr = "127.0.0.1:1" // nothing listens there
+	}
+	backendCfg := config.Backend{
+		Address:        primaryAddr,
 		Username:       backendUser,
 		Password:       backendPass,
-		ConnectTimeout: config.Duration(2 * time.Second),
-	}, poolCfg, log, nil)
-	if err != nil {
-		t.Fatalf("pool.New: %v", err)
+		ConnectTimeout: config.Duration(time.Second),
 	}
-	t.Cleanup(p.Close)
+	for i := 0; i < s.replicas; i++ {
+		replica := mysqltest.Start(t, backendUser, backendPass)
+		s.replicaServers = append(s.replicaServers, replica)
+		backendCfg.Replicas = append(backendCfg.Replicas, replica.Addr)
+	}
+
+	routing := s.routing
+	if routing.HealthInterval <= 0 {
+		routing.HealthInterval = config.Duration(50 * time.Millisecond)
+	}
+
+	topo, err := topology.New(backendCfg, s.pool, routing, log)
+	if err != nil {
+		t.Fatalf("topology.New: %v", err)
+	}
+	t.Cleanup(topo.Close)
 
 	var queryCache *cache.Cache
-	if cacheCfg != nil {
-		queryCache, err = cache.New(*cacheCfg, p, rules, log)
+	if s.cache != nil {
+		queryCache, err = cache.New(*s.cache, topo.Primary().Pool(), s.rules, log)
 		if err != nil {
 			t.Fatalf("cache.New: %v", err)
 		}
@@ -93,14 +126,16 @@ func startWith(t *testing.T, s setup) (*mysqltest.Server, *Server) {
 		t.Fatalf("throttle.New: %v", err)
 	}
 
+	listen := s.listen
 	if listen.Address == "" {
 		listen.Address = "127.0.0.1:0"
 	}
 	srv := New(Options{
 		Listen:   listen,
 		Users:    []config.User{{Username: clientUser, Password: clientPass}},
-		PoolCfg:  poolCfg,
-		Pool:     p,
+		PoolCfg:  s.pool,
+		Routing:  routing,
+		Topology: topo,
 		Cache:    queryCache,
 		Rewriter: rewriter,
 		Firewall: fw,
@@ -109,6 +144,10 @@ func startWith(t *testing.T, s setup) (*mysqltest.Server, *Server) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
+	if s.health || s.replicas > 0 || s.primaryDown {
+		go topo.Run(ctx)
+	}
+
 	done := make(chan error, 1)
 	go func() { done <- srv.Run(ctx) }()
 	t.Cleanup(func() {
@@ -130,6 +169,10 @@ func startWith(t *testing.T, s setup) (*mysqltest.Server, *Server) {
 	}
 	return backend, srv
 }
+
+// primaryPool is the pool the tests assert against when they are checking
+// how connections are handed back.
+func primaryPool(srv *Server) *pool.Pool { return srv.topo.Primary().Pool() }
 
 func connect(t *testing.T, srv *Server) *client.Conn {
 	t.Helper()
@@ -181,7 +224,7 @@ func TestConnectionIsReleasedBetweenStatements(t *testing.T) {
 	if _, err := c.Execute("SELECT 1"); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	waitFor(t, time.Second, func() bool { return srv.pool.Stat().Idle == 1 })
+	waitFor(t, time.Second, func() bool { return primaryPool(srv).Stat().Idle == 1 })
 	if pinned := srv.Stat().Pinned; pinned != 0 {
 		t.Fatalf("pinned sessions = %d, want 0", pinned)
 	}
@@ -220,14 +263,14 @@ func TestTransactionKeepsItsConnection(t *testing.T) {
 	if _, err := c.Execute("UPDATE wp_options SET option_value = 'x' WHERE option_name = 'y'"); err != nil {
 		t.Fatalf("UPDATE: %v", err)
 	}
-	if idle := srv.pool.Stat().Idle; idle != 0 {
+	if idle := primaryPool(srv).Stat().Idle; idle != 0 {
 		t.Fatalf("idle = %d during a transaction, want 0", idle)
 	}
 
 	if _, err := c.Execute("COMMIT"); err != nil {
 		t.Fatalf("COMMIT: %v", err)
 	}
-	waitFor(t, time.Second, func() bool { return srv.pool.Stat().Idle == 1 })
+	waitFor(t, time.Second, func() bool { return primaryPool(srv).Stat().Idle == 1 })
 }
 
 // State gora cannot reproduce on another connection pins the session.
@@ -253,7 +296,7 @@ func TestStatefulSessionsArePinned(t *testing.T) {
 			if pinned := srv.Stat().Pinned; pinned != 1 {
 				t.Fatalf("pinned sessions = %d, want 1", pinned)
 			}
-			if idle := srv.pool.Stat().Idle; idle != 0 {
+			if idle := primaryPool(srv).Stat().Idle; idle != 0 {
 				t.Fatalf("idle = %d, want 0: a pinned session released its connection", idle)
 			}
 		})
@@ -317,13 +360,13 @@ func TestPreparedStatementHoldsTheConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}
-	if idle := srv.pool.Stat().Idle; idle != 0 {
+	if idle := primaryPool(srv).Stat().Idle; idle != 0 {
 		t.Fatalf("idle = %d with a prepared statement open, want 0", idle)
 	}
 	if err := stmt.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	waitFor(t, time.Second, func() bool { return srv.pool.Stat().Idle == 1 })
+	waitFor(t, time.Second, func() bool { return primaryPool(srv).Stat().Idle == 1 })
 }
 
 // The connection cap refuses new clients instead of letting them queue up
@@ -362,7 +405,7 @@ func TestUnsupportedCommandIsRefusedCleanly(t *testing.T) {
 func TestResetConnectionClearsSessionState(t *testing.T) {
 	_, srv := start(t, config.Listen{}, poolConfig())
 
-	sess := &session{srv: srv, pool: srv.pool, log: slog.New(slog.DiscardHandler)}
+	sess := &session{srv: srv, topo: srv.topo, log: slog.New(slog.DiscardHandler)}
 	sess.inTx = true
 	sess.setStmts = []string{"SET NAMES utf8mb4"}
 	sess.varSig = "x"
@@ -407,7 +450,7 @@ func cacheConfig() *config.Cache {
 // The point of the whole milestone, seen from the client: the second
 // pageload does not reach MySQL.
 func TestCachedReadDoesNotReachTheBackend(t *testing.T) {
-	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig()})
+	backend, srv := startWith(t, &setup{pool: poolConfig(), cache: cacheConfig()})
 	c := connect(t, srv)
 
 	for i := 0; i < 3; i++ {
@@ -423,7 +466,7 @@ func TestCachedReadDoesNotReachTheBackend(t *testing.T) {
 // Inside a transaction a read must see this session's own writes, so the
 // cache steps aside entirely.
 func TestReadsInsideATransactionBypassTheCache(t *testing.T) {
-	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig()})
+	backend, srv := startWith(t, &setup{pool: poolConfig(), cache: cacheConfig()})
 	c := connect(t, srv)
 
 	if _, err := c.Execute(allOptions); err != nil {
@@ -442,7 +485,7 @@ func TestReadsInsideATransactionBypassTheCache(t *testing.T) {
 
 // A write flowing through gora drops what it affects, for every session.
 func TestWriteInvalidatesForOtherSessions(t *testing.T) {
-	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig()})
+	backend, srv := startWith(t, &setup{pool: poolConfig(), cache: cacheConfig()})
 
 	reader := connect(t, srv)
 	if _, err := reader.Execute(allOptions); err != nil {
@@ -470,7 +513,7 @@ func TestPaginatedListingIsServedFromCache(t *testing.T) {
 		Match:        `(?i)^SELECT SQL_CALC_FOUND_ROWS`,
 		InvalidateOn: []string{"{prefix}posts"},
 	}}
-	backend, srv := startWith(t, setup{pool: poolConfig(), cache: cacheConfig(), rules: rules})
+	backend, srv := startWith(t, &setup{pool: poolConfig(), cache: cacheConfig(), rules: rules})
 
 	listing := "SELECT SQL_CALC_FOUND_ROWS ID FROM wp_posts WHERE post_type = 'product' LIMIT 0, 16"
 	for i := 0; i < 2; i++ {
@@ -495,7 +538,7 @@ func TestPaginatedListingIsServedFromCache(t *testing.T) {
 
 // A rewrite must reach the backend, and the client must not notice.
 func TestRewrittenStatementReachesTheBackend(t *testing.T) {
-	backend, srv := startWith(t, setup{
+	backend, srv := startWith(t, &setup{
 		pool: poolConfig(),
 		rewrites: []rewrite.Rule{{
 			Name:  "drop-order-by-rand",
@@ -518,7 +561,7 @@ func TestRewrittenStatementReachesTheBackend(t *testing.T) {
 // A blocked statement never reaches the database, and the client is told
 // why in a way PHP will put in its error log.
 func TestBlockedStatementIsRefused(t *testing.T) {
-	backend, srv := startWith(t, setup{
+	backend, srv := startWith(t, &setup{
 		pool: poolConfig(),
 		blocks: []firewall.Rule{{
 			Name:    "no-truncate",
@@ -547,7 +590,7 @@ func TestBlockedStatementIsRefused(t *testing.T) {
 
 // A dry-run rule reports what it would have refused, and refuses nothing.
 func TestDryRunBlockLetsTheStatementThrough(t *testing.T) {
-	backend, srv := startWith(t, setup{
+	backend, srv := startWith(t, &setup{
 		pool: poolConfig(),
 		blocks: []firewall.Rule{{
 			Name:   "watch-truncate",
@@ -567,7 +610,7 @@ func TestDryRunBlockLetsTheStatementThrough(t *testing.T) {
 
 // Prepared statements must not be a way around the firewall.
 func TestBlockedStatementCannotBePrepared(t *testing.T) {
-	_, srv := startWith(t, setup{
+	_, srv := startWith(t, &setup{
 		pool:   poolConfig(),
 		blocks: []firewall.Rule{{Name: "no-truncate", Match: "(?i)^TRUNCATE"}},
 	})
@@ -581,7 +624,7 @@ func TestBlockedStatementCannotBePrepared(t *testing.T) {
 // Past the limit the excess is refused rather than queued, and the client
 // gets an error naming the rule instead of a connection that hangs.
 func TestThrottleRefusesTheExcess(t *testing.T) {
-	backend, srv := startWith(t, setup{
+	backend, srv := startWith(t, &setup{
 		pool: poolConfig(),
 		throttles: []throttle.Rule{{
 			Name:          "heavy-search",
@@ -625,7 +668,7 @@ func TestThrottleRefusesTheExcess(t *testing.T) {
 // A cache hit costs the database nothing, so it must not need a slot
 // either.
 func TestThrottleDoesNotApplyToCacheHits(t *testing.T) {
-	_, srv := startWith(t, setup{
+	_, srv := startWith(t, &setup{
 		pool:  poolConfig(),
 		cache: cacheConfig(),
 		throttles: []throttle.Rule{{
