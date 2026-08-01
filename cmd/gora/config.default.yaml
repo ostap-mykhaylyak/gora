@@ -56,6 +56,32 @@ routing:
   # How often each node is checked: reachable, read-only, how far behind.
   health_interval: 2s
 
+replication:
+  # Let gora set up and govern MySQL's own replication, so the servers
+  # never have to be configured by hand. With this on, `gora --init-cluster`
+  # turns the nodes above into a replicating cluster: GTIDs, distinct
+  # server ids, the replication account, and the replicas following the
+  # primary.
+  enabled: false
+  # Credentials for cluster operations only — creating users and changing
+  # global variables are not privileges the proxy account should carry.
+  admin_username: "root"
+  admin_password: "change-me"
+  # The account gora creates on the primary for the replicas to use.
+  user: "gora_repl"
+  password: "change-me"
+  # What happens when the primary is unreachable:
+  #   manual    - gora reports it and changes nothing; you run
+  #               `gora --promote <address>` when you have decided
+  #   automatic - gora promotes the best replica by itself after
+  #               failover_delay
+  failover: manual
+  failover_delay: 30s
+  # Where the current primary is recorded, so a promotion survives a restart
+  # of gora. Without it, gora would come back and try to write to the node
+  # this file calls the primary, which by then is a replica.
+  state_file: /var/lib/gora/cluster.json
+
 pool:
   # Cap on backend connections (in use + idle). Applies per node.
   max_open: 100

@@ -56,6 +56,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = checkConfig(opts.configPath, stdout)
 	case opts.advice:
 		err = printAdvice(opts.configPath, stdout)
+	case opts.initCluster:
+		err = initCluster(opts.configPath, stdout)
+	case opts.promote != "":
+		err = promote(opts.configPath, opts.promote, stdout)
 	default:
 		switch opts.command {
 		case "start":

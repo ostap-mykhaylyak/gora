@@ -20,6 +20,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/pool"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
+	"github.com/ostap-mykhaylyak/gora/internal/replication"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
 	"github.com/ostap-mykhaylyak/gora/internal/topology"
 )
@@ -42,6 +43,8 @@ type Snapshot struct {
 	Firewall firewall.Stats       `json:"firewall"`
 	Throttle throttle.Stats       `json:"throttle"`
 	Rewrites int                  `json:"rewrite_rules"`
+
+	Replication []replication.NodeStatus `json:"replication,omitempty"`
 }
 
 // Uptime returns the uptime as a duration.

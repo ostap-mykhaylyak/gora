@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,10 +30,14 @@ const (
 )
 
 // Node is one MySQL server and gora's pool of connections to it.
+//
+// The role is not a constant: a promotion turns a replica into the primary
+// while gora is running, and the sessions holding connections to it carry
+// on as if nothing had happened.
 type Node struct {
 	Address string
-	Role    Role
 
+	role atomic.Pointer[Role]
 	pool *pool.Pool
 	log  *slog.Logger
 
@@ -46,6 +51,16 @@ type Node struct {
 
 // Pool returns the node's connection pool.
 func (n *Node) Pool() *pool.Pool { return n.pool }
+
+// Role returns what the node is for right now.
+func (n *Node) Role() Role {
+	if r := n.role.Load(); r != nil {
+		return *r
+	}
+	return RoleReplica
+}
+
+func (n *Node) setRole(r Role) { n.role.Store(&r) }
 
 // Up reports whether the last health check reached the node.
 func (n *Node) Up() bool { return n.up.Load() }
@@ -76,6 +91,7 @@ type Topology struct {
 	cfg config.Routing
 	log *slog.Logger
 
+	mu       sync.RWMutex
 	primary  *Node
 	replicas []*Node
 
@@ -119,7 +135,8 @@ func (t *Topology) newNode(backend config.Backend, addr string, role Role, poolC
 		return nil, fmt.Errorf("node %s: %w", addr, err)
 	}
 
-	n := &Node{Address: addr, Role: role, pool: p, log: nodeLog}
+	n := &Node{Address: addr, pool: p, log: nodeLog}
+	n.setRole(role)
 	// Assumed reachable until a check says otherwise: refusing traffic for
 	// the first health interval would make every restart an outage.
 	n.up.Store(true)
@@ -128,34 +145,104 @@ func (t *Topology) newNode(backend config.Backend, addr string, role Role, poolC
 }
 
 // Primary returns the node writes go to.
-func (t *Topology) Primary() *Node { return t.primary }
+func (t *Topology) Primary() *Node {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.primary
+}
 
 // HasReplicas reports whether there is anything to split reads onto.
-func (t *Topology) HasReplicas() bool { return len(t.replicas) > 0 }
+func (t *Topology) HasReplicas() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.replicas) > 0
+}
 
 // Replicas returns the read nodes.
-func (t *Topology) Replicas() []*Node { return t.replicas }
+func (t *Topology) Replicas() []*Node {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return append([]*Node(nil), t.replicas...)
+}
+
+// Nodes returns every node, primary first.
+func (t *Topology) Nodes() []*Node {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return append([]*Node{t.primary}, t.replicas...)
+}
+
+// Node returns the node at an address.
+func (t *Topology) Node(address string) (*Node, bool) {
+	for _, n := range t.Nodes() {
+		if n.Address == address {
+			return n, true
+		}
+	}
+	return nil, false
+}
+
+// Promote makes a replica the primary and demotes the old one, which
+// becomes a replica of the new primary as soon as it answers again.
+//
+// This only changes gora's idea of the cluster. Telling MySQL about it is
+// the replication manager's job, and it calls this once the servers agree.
+func (t *Topology) Promote(n *Node) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if n == t.primary {
+		return fmt.Errorf("node %s is already the primary", n.Address)
+	}
+	idx := -1
+	for i, r := range t.replicas {
+		if r == n {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("node %s is not part of this cluster", n.Address)
+	}
+
+	old := t.primary
+	t.replicas[idx] = old
+	old.setRole(RoleReplica)
+	// The demoted node keeps whatever lag it last reported; it is about to
+	// be repointed, and until a check says otherwise its lag is unknown.
+	old.lagSeconds.Store(-1)
+
+	t.primary = n
+	n.setRole(RolePrimary)
+	n.lagSeconds.Store(0)
+	t.log.Warn("primary changed", "new_primary", n.Address, "old_primary", old.Address)
+	return nil
+}
 
 // PickReader returns the node a read should go to: an eligible replica in
 // turn, or the primary when there is none. It never returns nil — a read
 // has to go somewhere, and the primary is where it went before there were
 // replicas at all.
 func (t *Topology) PickReader() *Node {
-	n := len(t.replicas)
+	t.mu.RLock()
+	primary, replicas := t.primary, t.replicas
+	t.mu.RUnlock()
+
+	n := len(replicas)
 	if n == 0 {
-		return t.primary
+		return primary
 	}
 
 	start := int(t.next.Add(1) % uint64(n))
 	for i := 0; i < n; i++ {
-		candidate := t.replicas[(start+i)%n]
+		candidate := replicas[(start+i)%n]
 		if t.eligible(candidate) {
 			return candidate
 		}
 	}
 	// Every replica is down or too far behind: the reads go where the data
 	// certainly is.
-	return t.primary
+	return primary
 }
 
 // eligible reports whether a replica may serve reads right now.
@@ -177,15 +264,16 @@ func (t *Topology) eligible(n *Node) bool {
 
 // WritesAccepted reports whether the primary can currently take a write.
 func (t *Topology) WritesAccepted() bool {
-	return t.primary.up.Load() && !t.primary.readOnly.Load()
+	p := t.Primary()
+	return p.up.Load() && !p.readOnly.Load()
 }
 
 // Stat returns every node, primary first.
 func (t *Topology) Stat() []NodeStats {
-	out := make([]NodeStats, 0, 1+len(t.replicas))
-	out = append(out, t.stat(t.primary))
-	for _, r := range t.replicas {
-		out = append(out, t.stat(r))
+	nodes := t.Nodes()
+	out := make([]NodeStats, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, t.stat(n))
 	}
 	return out
 }
@@ -193,13 +281,13 @@ func (t *Topology) Stat() []NodeStats {
 func (t *Topology) stat(n *Node) NodeStats {
 	st := NodeStats{
 		Address:    n.Address,
-		Role:       n.Role,
+		Role:       n.Role(),
 		Up:         n.up.Load(),
 		ReadOnly:   n.readOnly.Load(),
 		LagSeconds: n.lagSeconds.Load(),
 		Pool:       n.pool.Stat(),
 	}
-	if n.Role == RoleReplica {
+	if n.Role() == RoleReplica {
 		st.Eligible = t.eligible(n)
 	} else {
 		st.Eligible = n.up.Load()
@@ -217,11 +305,10 @@ func (t *Topology) Close() {
 	default:
 		close(t.stop)
 	}
-	if t.primary != nil {
-		t.primary.pool.Close()
-	}
-	for _, r := range t.replicas {
-		r.pool.Close()
+	for _, n := range t.Nodes() {
+		if n != nil {
+			n.pool.Close()
+		}
 	}
 }
 

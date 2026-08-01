@@ -20,6 +20,7 @@ import (
 	"github.com/ostap-mykhaylyak/gora/internal/firewall"
 	"github.com/ostap-mykhaylyak/gora/internal/profile"
 	"github.com/ostap-mykhaylyak/gora/internal/proxy"
+	"github.com/ostap-mykhaylyak/gora/internal/replication"
 	"github.com/ostap-mykhaylyak/gora/internal/rewrite"
 	"github.com/ostap-mykhaylyak/gora/internal/status"
 	"github.com/ostap-mykhaylyak/gora/internal/throttle"
@@ -125,6 +126,19 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 	}
 	traffic.log(log, rulesDir)
 
+	var replicator *replication.Manager
+	if cfg.Replication.Enabled {
+		replicator, err = replication.New(cfg.Replication, topo, log)
+		if err != nil {
+			return err
+		}
+		go replicator.Run(ctx)
+		log.Info("replication management enabled",
+			"failover", cfg.Replication.Failover,
+			"failover_delay", cfg.Replication.FailoverDelay,
+			"state_file", cfg.Replication.StateFile)
+	}
+
 	var profiler *profile.Profiler
 	if cfg.Profiling.Enabled {
 		profiler = profile.New(cfg.Profiling, backendPool, log)
@@ -177,6 +191,9 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 			if queryCache != nil {
 				rep := queryCache.ReportStats()
 				snap.Cache = &rep
+			}
+			if replicator != nil {
+				snap.Replication = replicator.Status()
 			}
 			return snap
 		}
@@ -359,6 +376,26 @@ func printStatus(configPath string, stdout io.Writer) error {
 		}
 		if n.LastError != "" {
 			fmt.Fprintf(stdout, "          last error: %s\n", n.LastError)
+		}
+		for _, r := range snap.Replication {
+			if r.Address != n.Address {
+				continue
+			}
+			switch {
+			case !r.Checked:
+				fmt.Fprintln(stdout, "          replication: could not be read")
+			case r.SourceHost == "":
+				fmt.Fprintln(stdout, "          replication: not replicating from anybody")
+			default:
+				threads := "io+sql running"
+				if !r.IORunning || !r.SQLRunning {
+					threads = fmt.Sprintf("io %v, sql %v — STOPPED", r.IORunning, r.SQLRunning)
+				}
+				fmt.Fprintf(stdout, "          replication: from %s, %s\n", r.SourceHost, threads)
+			}
+			if r.LastError != "" {
+				fmt.Fprintf(stdout, "          replication error: %s\n", r.LastError)
+			}
 		}
 	}
 	// Waits are the number that says max_open is too small; without them the

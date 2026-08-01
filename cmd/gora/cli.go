@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -30,6 +31,8 @@ Options (always two dashes):
   --init          install gora as a systemd service and exit
   --check-config  validate the configuration and exit
   --advice        print what the profiler has suggested, and exit
+  --init-cluster  configure the servers into a replicating cluster and exit
+  --promote <addr> make that node the primary and exit
   --version       print the version and exit
   --help          print this help and exit
 `
@@ -43,6 +46,8 @@ type options struct {
 	install     bool
 	checkConfig bool
 	advice      bool
+	initCluster bool
+	promote     string
 	version     bool
 	help        bool
 }
@@ -86,6 +91,23 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.advice = true
+			case "init-cluster":
+				if err := noValue(name, hasValue); err != nil {
+					return opts, err
+				}
+				opts.initCluster = true
+			case "promote":
+				if !hasValue {
+					i++
+					if i >= len(args) {
+						return opts, fmt.Errorf("--promote needs the address of the node to promote")
+					}
+					value = args[i]
+				}
+				if value == "" {
+					return opts, fmt.Errorf("--promote needs the address of the node to promote")
+				}
+				opts.promote = value
 			case "version":
 				if err := noValue(name, hasValue); err != nil {
 					return opts, err
@@ -120,18 +142,25 @@ func parseArgs(args []string) (options, error) {
 		}
 	}
 
-	if opts.command != "" && (opts.install || opts.checkConfig || opts.advice) {
-		action := "--init"
-		switch {
-		case opts.checkConfig:
-			action = "--check-config"
-		case opts.advice:
-			action = "--advice"
-		}
-		return opts, fmt.Errorf("%s does not take a command (drop %q)", action, opts.command)
+	actions := map[string]bool{
+		"--init":         opts.install,
+		"--check-config": opts.checkConfig,
+		"--advice":       opts.advice,
+		"--init-cluster": opts.initCluster,
+		"--promote":      opts.promote != "",
 	}
-	if opts.install && opts.checkConfig {
-		return opts, fmt.Errorf("--init and --check-config do different things: run one at a time")
+	var chosen []string
+	for name, on := range actions {
+		if on {
+			chosen = append(chosen, name)
+		}
+	}
+	sort.Strings(chosen)
+	if len(chosen) > 1 {
+		return opts, fmt.Errorf("%s do different things: run one at a time", strings.Join(chosen, " and "))
+	}
+	if opts.command != "" && len(chosen) == 1 {
+		return opts, fmt.Errorf("%s does not take a command (drop %q)", chosen[0], opts.command)
 	}
 
 	return opts, nil

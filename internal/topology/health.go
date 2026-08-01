@@ -15,8 +15,8 @@ const checkTimeout = 3 * time.Second
 // checkAll checks every node in parallel, so a node that has stopped
 // answering does not delay the verdict on the others.
 func (t *Topology) checkAll(ctx context.Context) {
-	done := make(chan struct{}, 1+len(t.replicas))
-	nodes := append([]*Node{t.primary}, t.replicas...)
+	nodes := t.Nodes()
+	done := make(chan struct{}, len(nodes))
 	for _, n := range nodes {
 		go func(n *Node) {
 			t.check(ctx, n)
@@ -57,7 +57,7 @@ func (t *Topology) check(ctx context.Context, n *Node) {
 		n.readOnly.Store(readOnly)
 	}
 
-	if n.Role == RoleReplica {
+	if n.Role() == RoleReplica {
 		if lag, ok := replicaLag(conn); ok {
 			n.lagSeconds.Store(lag)
 		} else {

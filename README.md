@@ -8,9 +8,8 @@ water, MySQL is the mill.
 
 > ⚠️ **Early development.** gora proxies traffic, pools connections,
 > multiplexes them, caches WordPress's hottest reads, splits reads from
-> writes across replicas, and can rewrite, refuse, throttle and profile what
-> goes through it. The replication manager is still to come — see the
-> roadmap.
+> writes across replicas, sets up and governs the replication between them,
+> and can rewrite, refuse, throttle and profile what goes through it.
 
 ## Features
 
@@ -101,6 +100,23 @@ water, MySQL is the mill.
   sees a database saying no rather than a connection timing out. A primary
   that has quietly become read-only — a failover nobody told gora about —
   is treated the same way.
+- **Replication management** — gora does not copy data between servers: MySQL
+  has done that for twenty years with binary logs and GTIDs. What it does is
+  the part above. Point it at empty MySQL servers, run `gora --init-cluster`,
+  and it checks each one can replicate, turns on GTIDs, gives them distinct
+  server ids, creates the replication account, seeds the replicas with the
+  clone plugin when the primary already has data, and starts them following
+  the primary. No `my.cnf` is edited by hand, and a replica that has data of
+  its own is refused rather than overwritten.
+- **Failover** — when the primary goes, `gora --promote <address>` makes a
+  replica the primary: it stops replicating, forgets where it was replicating
+  from, becomes writable, and the others are repointed at it. With
+  `replication.failover: automatic` gora does it by itself after
+  `failover_delay`. The new primary is recorded in a state file, so a restart
+  of gora does not go back to writing to a server that is now a replica — and
+  a running gora picks up a promotion made on the command line without being
+  restarted. The default is manual: promoting a primary has consequences that
+  outlive the incident.
 - **Circuit breaker** — when MySQL is down, waiting for per-request timeouts
   melts PHP-FPM. After `pool.breaker.failures` consecutive failures gora
   fails fast with a clean error and probes the backend until it recovers.
@@ -143,6 +159,8 @@ gora status                   # print the state of the running instance
 gora --init                   # install as a systemd service
 gora --check-config           # validate the configuration and exit
 gora --advice                 # print what the profiler has suggested
+gora --init-cluster           # configure the servers into a replicating cluster
+gora --promote 10.0.0.11:3306 # make that node the primary
 gora --config /etc/gora/config.yaml
 gora --version
 gora --help
@@ -196,6 +214,16 @@ routing:
   sticky_after_write: 3s     # a session reads its own writes from the primary
   max_replica_lag: 5s        # a replica further behind stops serving reads
   health_interval: 2s
+
+replication:
+  enabled: false             # let gora configure and govern the cluster
+  admin_username: "root"     # for cluster operations only, never for traffic
+  admin_password: "change-me"
+  user: "gora_repl"          # the account the replicas connect with
+  password: "change-me"
+  failover: manual           # manual | automatic
+  failover_delay: 30s
+  state_file: /var/lib/gora/cluster.json
 
 pool:
   max_open: 100
@@ -320,8 +348,8 @@ per-customer data — carts, sessions, orders.
 | ~~M2~~ | cache | WordPress-aware query cache, conf.d rules, hot reload, warm-up |
 | ~~M3~~ | traffic | query rewriting, firewall, per-digest throttling |
 | ~~M4~~ | profiling | slow query log, aggregated report, index and rewrite advisor |
-| **M5** | topology | multiple nodes, health checks, read/write split, degraded mode |
-| M6 | replication | GTID provisioning, seeding, monitoring, failover |
+| ~~M5~~ | topology | multiple nodes, health checks, read/write split, degraded mode |
+| **M6** | replication | GTID provisioning, seeding, monitoring, failover |
 | M7 | observability | `gora top`, extended status, documentation |
 
 ## Development

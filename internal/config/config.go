@@ -23,6 +23,8 @@ type Config struct {
 	Backend Backend `yaml:"backend"`
 	Users   []User  `yaml:"users"`
 	Routing Routing `yaml:"routing"`
+
+	Replication Replication `yaml:"replication"`
 	Pool    Pool    `yaml:"pool"`
 	Cache   Cache   `yaml:"cache"`
 
@@ -70,6 +72,47 @@ type Backend struct {
 	// ConnectTimeout bounds a single dial to a node.
 	ConnectTimeout Duration   `yaml:"connect_timeout"`
 	TLS            BackendTLS `yaml:"tls"`
+}
+
+// FailoverMode says what gora does when the primary stops answering.
+type FailoverMode string
+
+const (
+	// FailoverManual reports the situation and changes nothing. It is the
+	// default: promoting a primary is a decision with consequences that
+	// outlive the incident.
+	FailoverManual FailoverMode = "manual"
+	// FailoverAutomatic promotes a replica on its own.
+	FailoverAutomatic FailoverMode = "automatic"
+)
+
+// Replication configures gora as the thing that sets up and governs MySQL's
+// own replication, so the servers themselves never have to be configured by
+// hand.
+//
+// It needs credentials of its own: creating users and changing global
+// variables are not privileges the proxy account should carry around.
+type Replication struct {
+	Enabled bool `yaml:"enabled"`
+	// AdminUsername and AdminPassword are used only for cluster operations
+	// — never for client traffic.
+	AdminUsername string `yaml:"admin_username"`
+	AdminPassword string `yaml:"admin_password"`
+	// User and Password are the replication account gora creates on the
+	// primary and the replicas connect with.
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	// Failover is what happens when the primary is gone.
+	Failover FailoverMode `yaml:"failover"`
+	// FailoverDelay is how long the primary must be unreachable before an
+	// automatic failover starts. Too short and a network hiccup promotes a
+	// replica; too long and the outage is the delay.
+	FailoverDelay Duration `yaml:"failover_delay"`
+	// StateFile records which node is currently the primary, so a promotion
+	// survives a restart of gora. Without it, gora would come back and try
+	// to write to the node the configuration calls the primary, which by
+	// then is a replica.
+	StateFile string `yaml:"state_file"`
 }
 
 // Routing decides which node a statement goes to.
@@ -272,6 +315,12 @@ func Default() Config {
 			MaxReplicaLag:    Duration(5 * time.Second),
 			HealthInterval:   Duration(2 * time.Second),
 		},
+		Replication: Replication{
+			User:          "gora_repl",
+			Failover:      FailoverManual,
+			FailoverDelay: Duration(30 * time.Second),
+			StateFile:     "/var/lib/gora/cluster.json",
+		},
 		Pool: Pool{
 			MaxOpen:        100,
 			MaxIdle:        10,
@@ -446,6 +495,33 @@ func (c *Config) validateBackend() error {
 	}
 	if c.Routing.HealthInterval <= 0 {
 		return fmt.Errorf("routing.health_interval must be > 0")
+	}
+
+	if c.Replication.Enabled {
+		if c.Replication.AdminUsername == "" {
+			return fmt.Errorf("replication.admin_username is required: setting up replication needs privileges the proxy account does not have")
+		}
+		if c.Replication.User == "" {
+			return fmt.Errorf("replication.user is required")
+		}
+		if c.Replication.Password == "" {
+			return fmt.Errorf("replication.password is required: the replicas authenticate to the primary with it")
+		}
+		switch c.Replication.Failover {
+		case FailoverManual, FailoverAutomatic:
+		default:
+			return fmt.Errorf("replication.failover %q: must be %q or %q",
+				c.Replication.Failover, FailoverManual, FailoverAutomatic)
+		}
+		if c.Replication.Failover == FailoverAutomatic && c.Replication.FailoverDelay <= 0 {
+			return fmt.Errorf("replication.failover_delay must be > 0 for automatic failover: promoting on the first missed check turns a network hiccup into a promotion")
+		}
+		if c.Replication.StateFile != "" && !strings.HasPrefix(c.Replication.StateFile, "/") {
+			return fmt.Errorf("replication.state_file %q must be an absolute path", c.Replication.StateFile)
+		}
+		if len(c.Backend.Replicas) == 0 {
+			return fmt.Errorf("replication.enabled needs at least one node in backend.replicas")
+		}
 	}
 
 	if len(c.Users) == 0 {
