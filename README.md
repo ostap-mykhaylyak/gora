@@ -194,27 +194,137 @@ gora --help
 `/run/gora/gora.pid`. Under systemd the usual `systemctl {start,stop,reload}
 gora` works as well — the unit runs `gora start` and reloads with SIGHUP.
 
-## Quick start
+## Installing, step by step
 
-Download the Linux binary from the Releases page and let `--init` install
-everything (it must run as root):
+One MySQL server, one WordPress site, from nothing. Every step is a command
+you can copy; nothing is edited by hand.
+
+### 1. Install the binary and the service
+
+Download the Linux binary for your architecture from the Releases page, then:
 
 ```sh
 sudo ./gora --init
 ```
 
-It copies the running binary to `/sbin/gora`, creates the `gora` system user,
-`/etc/gora` (with `conf.d`), `/var/log/gora`, the systemd unit and the
-logrotate configuration. Re-run it after downloading a new binary: that is
-the upgrade procedure. Everything gora manages is rewritten, with one
-exception — an existing `config.yaml` is copied to `config.yaml.bak` first.
+That copies the running binary to `/sbin/gora`, creates the `gora` system
+user, `/etc/gora` with its `conf.d` (including the WooCommerce profile),
+`/var/log/gora`, the systemd unit and the logrotate configuration, and
+reloads systemd. It does not start anything yet.
+
+> `--init` is also the upgrade procedure: download a new binary, run it
+> again, restart. Everything gora manages is rewritten, with one exception —
+> your `config.yaml` is copied to `config.yaml.bak` first.
+
+### 2. Point gora at the database
 
 ```sh
-sudo $EDITOR /etc/gora/config.yaml
+sudo gora --set backend.address=10.0.0.10:3306
+sudo gora --set backend.username=wordpress
+sudo gora --set backend.password=-
+```
+
+The `-` means the password is typed in rather than passed as an argument,
+which keeps it out of the shell history. These are gora's own credentials
+for MySQL — the account WordPress uses today is fine.
+
+> **If MySQL is on the same machine**, it already has port 3306 and gora
+> cannot have it too. Move gora:
+>
+> ```sh
+> sudo gora --set listen.address=127.0.0.1:3307
+> sudo gora --set backend.address=127.0.0.1:3306
+> ```
+>
+> WordPress then connects to `127.0.0.1:3307`. Nothing else changes.
+
+`gora --settings` lists every setting there is, with its value and whether
+changing it needs a restart.
+
+The database user needs nothing beyond the privileges it already has. gora
+kills a runaway statement on a connection of its own, and reading a
+connection's own thread needs no privilege at all.
+
+One grant becomes useful once there are replicas:
+
+```sql
+GRANT REPLICATION CLIENT ON *.* TO 'wordpress'@'%';
+```
+
+Without it gora cannot read how far behind a replica is. That is not fatal —
+it is treated as a lag it does not know — but with `routing.max_replica_lag`
+set, a replica whose lag is unknown stays out of the read rotation, so
+without this grant the replicas would never be used.
+
+### 3. Give WordPress an account of its own (optional, recommended)
+
+```sh
+sudo gora --add-user wordpress
+```
+
+It asks for a password. This is the account WordPress authenticates to
+*gora* with; MySQL never sees it, so the real database password stops living
+in `wp-config.php`. Skip this step and clients authenticate with the backend
+credentials instead.
+
+### 4. Check, then start
+
+```sh
 sudo gora --check-config
 sudo systemctl enable --now gora
 gora status
 ```
+
+`--check-config` validates the file and compiles every conf.d rule, so a
+mistake is a message rather than a service that will not come up.
+
+### 5. Point WordPress at gora
+
+In `wp-config.php`:
+
+```php
+define( 'DB_HOST', '127.0.0.1:3306' ); // gora's listen.address
+define( 'DB_USER', 'wordpress' );      // the account from step 3
+define( 'DB_PASSWORD', '...' );        // the password from step 3
+```
+
+Keep `DB_NAME` as it is: gora forwards whichever database the client
+selects.
+
+Load a page, then look:
+
+```sh
+gora top
+```
+
+Statements per second climbing and a cache hit ratio settling somewhere
+above zero means it is working. The table prefix is discovered from the
+database on the first query, so the cache stays quiet for a moment and then
+starts answering.
+
+### 6. Turn the profiler on for a while
+
+```sh
+sudo gora --set profiling.enabled=true
+sudo systemctl restart gora
+```
+
+Leave it for a busy day, then:
+
+```sh
+gora --advice
+```
+
+It reports which statements the time actually went into, and what to do
+about the worst of them — the `ALTER TABLE` for a missing index, a FULLTEXT
+index for a search no B-tree can serve, the conf.d rule for a known
+antipattern. gora never runs DDL itself.
+
+### What you have now
+
+A single-server installation with pooling, multiplexing and the WordPress
+cache. Adding a replica later is [one command](#growing-from-one-server) and
+does not need a restart.
 
 ## Configuration
 
