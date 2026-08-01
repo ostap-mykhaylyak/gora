@@ -1,20 +1,19 @@
-// Package config loads and validates gora's YAML configuration.
+// Package config loads, validates and edits gora's YAML configuration.
 //
-// The whole configuration lives in one file (plus the conf.d drop-ins that
-// later milestones read): gora has no SQL admin interface and no runtime
-// mutation of its own settings, so the file on disk is always the truth.
+// The whole configuration lives in one file, plus the conf.d drop-ins for
+// the traffic rules: gora has no SQL admin interface, and the file on disk
+// is always the truth. The command line changes settings by editing that
+// file — surgically, leaving every line it is not changing exactly as it
+// was — and then asking a running gora to re-read it.
 package config
 
 import (
-	"bytes"
 	"fmt"
 	"net"
 	"os"
 	"regexp"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Config is the root of config.yaml.
@@ -104,11 +103,11 @@ type Replication struct {
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	// Failover is what happens when the primary is gone.
-	Failover FailoverMode `yaml:"failover"`
+	Failover FailoverMode `yaml:"failover" hot:"true"`
 	// FailoverDelay is how long the primary must be unreachable before an
 	// automatic failover starts. Too short and a network hiccup promotes a
 	// replica; too long and the outage is the delay.
-	FailoverDelay Duration `yaml:"failover_delay"`
+	FailoverDelay Duration `yaml:"failover_delay" hot:"true"`
 }
 
 // Cluster is what gora remembers about the servers between restarts.
@@ -133,11 +132,11 @@ type Routing struct {
 	// shop that has just saved an order reads back the state before it, and
 	// the customer sees an empty basket. Zero sends reads to replicas
 	// immediately, which is only safe if nothing reads what it just wrote.
-	StickyAfterWrite Duration `yaml:"sticky_after_write"`
+	StickyAfterWrite Duration `yaml:"sticky_after_write" hot:"true"`
 	// MaxReplicaLag takes a replica out of the read rotation while it is
 	// further behind than this (0 = do not check). A replica an hour behind
 	// is not a replica, it is a backup.
-	MaxReplicaLag Duration `yaml:"max_replica_lag"`
+	MaxReplicaLag Duration `yaml:"max_replica_lag" hot:"true"`
 	// HealthInterval is how often each node is checked.
 	HealthInterval Duration `yaml:"health_interval"`
 }
@@ -245,20 +244,20 @@ type Cache struct {
 	// prefixes behind one gora should name theirs explicitly.
 	TablePrefix string `yaml:"table_prefix"`
 	// AutoloadOptions caches the autoloaded options query.
-	AutoloadOptions bool `yaml:"autoload_options"`
+	AutoloadOptions bool `yaml:"autoload_options" hot:"true"`
 	// Transients caches transient reads from the options table.
-	Transients bool `yaml:"transients"`
+	Transients bool `yaml:"transients" hot:"true"`
 	// DefaultTTL is the safety expiry for cached entries; write-driven
 	// invalidation is the mechanism that actually keeps them correct.
-	DefaultTTL Duration `yaml:"default_ttl"`
+	DefaultTTL Duration `yaml:"default_ttl" hot:"true"`
 	// MaxEntries bounds how many result sets are held.
-	MaxEntries int `yaml:"max_entries"`
+	MaxEntries int `yaml:"max_entries" hot:"true"`
 	// MaxBytes bounds how much memory they take (0 = unbounded). Entry
 	// counts alone do not: a thousand small rows and a thousand large ones
 	// are the same number and very different amounts of RAM.
-	MaxBytes int `yaml:"max_bytes"`
+	MaxBytes int `yaml:"max_bytes" hot:"true"`
 	// MaxResultBytes skips caching results larger than this.
-	MaxResultBytes int `yaml:"max_result_bytes"`
+	MaxResultBytes int `yaml:"max_result_bytes" hot:"true"`
 	// RulesDir holds the conf.d drop-ins. Empty means "conf.d next to the
 	// configuration file".
 	RulesDir string `yaml:"rules_dir"`
@@ -299,7 +298,7 @@ type Status struct {
 
 // Log controls logging output.
 type Log struct {
-	Level  string `yaml:"level"`
+	Level  string `yaml:"level" hot:"true"`
 	Format string `yaml:"format"`
 	// Path is the directory gora.log is written to. The special values
 	// "stdout" and "stderr" log to the console instead, which is what you
@@ -375,28 +374,11 @@ func Default() Config {
 // place, because the symptom would show up months later as "gora ignores
 // this option".
 func Load(path string) (Config, error) {
-	cfg := Default()
-
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return cfg, fmt.Errorf("reading config: %w", err)
+		return Default(), fmt.Errorf("reading config: %w", err)
 	}
-
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil {
-		return cfg, fmt.Errorf("parsing %s: %w", path, err)
-	}
-
-	// No users defined: clients authenticate with the backend credentials.
-	if len(cfg.Users) == 0 {
-		cfg.Users = []User{{Username: cfg.Backend.Username, Password: cfg.Backend.Password}}
-	}
-
-	if err := cfg.Validate(); err != nil {
-		return cfg, fmt.Errorf("invalid config %s: %w", path, err)
-	}
-	return cfg, nil
+	return Parse(data, path)
 }
 
 // Validate checks the configuration for consistency. Errors name the exact

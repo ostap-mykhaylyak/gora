@@ -134,7 +134,6 @@ func startWith(t *testing.T, s *setup) (*mysqltest.Server, *Server) {
 		Listen:   listen,
 		Users:    []config.User{{Username: clientUser, Password: clientPass}},
 		PoolCfg:  s.pool,
-		Routing:  routing,
 		Topology: topo,
 		Cache:    queryCache,
 		Rewriter: rewriter,

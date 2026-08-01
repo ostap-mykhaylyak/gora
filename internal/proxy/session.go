@@ -52,7 +52,6 @@ type session struct {
 	srv      *Server
 	topo     *topology.Topology
 	cfg      config.Pool
-	routing  config.Routing
 	cache    *cache.Cache // nil when the cache is disabled
 	rewriter *rewrite.Rewriter
 	firewall *firewall.Firewall
@@ -105,7 +104,6 @@ func newSession(ctx context.Context, srv *Server, log *slog.Logger) *session {
 		srv:      srv,
 		topo:     srv.topo,
 		cfg:      srv.cfg,
-		routing:  srv.routing,
 		cache:    srv.cache,
 		rewriter: srv.rewriter,
 		firewall: srv.firewall,
@@ -229,10 +227,14 @@ func writeBound(kind statement.Kind) bool {
 // stickyActive reports whether this session's reads are still tied to the
 // primary after a write of its own.
 func (s *session) stickyActive() bool {
-	if !s.topo.HasReplicas() || s.routing.StickyAfterWrite <= 0 || s.lastWrite.IsZero() {
+	if s.lastWrite.IsZero() || !s.topo.HasReplicas() {
 		return false
 	}
-	return time.Since(s.lastWrite) < s.routing.StickyAfterWrite.Std()
+	// Read from the topology rather than from a copy taken when the session
+	// opened: a WordPress connection outlives several reloads, and a setting
+	// changed an hour ago should apply to it.
+	sticky := s.topo.Routing().StickyAfterWrite
+	return sticky > 0 && time.Since(s.lastWrite) < sticky.Std()
 }
 
 // errWritesRefused is what a client is told when the primary cannot take

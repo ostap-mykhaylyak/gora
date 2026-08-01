@@ -218,6 +218,96 @@ func TestPromoteNeedsAnAddress(t *testing.T) {
 	}
 }
 
+// Changing a setting from the command line: validated, written, and the
+// rest of the file left exactly as it was.
+func TestRunSetAndGet(t *testing.T) {
+	path := writeDefaultConfig(t)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--set", "cache.default_ttl=11m", "--config", path}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, errOut.String())
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(after), "default_ttl: 11m") {
+		t.Fatalf("the setting was not written")
+	}
+	if strings.Count(string(after), "\n") != strings.Count(string(before), "\n") {
+		t.Fatal("the file changed length: something other than the setting was edited")
+	}
+	if !strings.Contains(string(after), "# gora configuration") {
+		t.Fatal("the comments did not survive the edit")
+	}
+
+	out.Reset()
+	if code := run([]string{"--get", "cache.default_ttl", "--config", path}, &out, &errOut); code != 0 {
+		t.Fatalf("--get exit code = %d", code)
+	}
+	if got := strings.TrimSpace(out.String()); got != "11m" {
+		t.Fatalf("--get printed %q, want 11m", got)
+	}
+}
+
+// A value the configuration would refuse never reaches the file: the point
+// of setting it through gora is that gora checks it first.
+func TestRunSetRefusesAnInvalidValue(t *testing.T) {
+	path := writeDefaultConfig(t)
+	before, _ := os.ReadFile(path)
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--set", "pool.max_open=0", "--config", path}, &out, &errOut); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("the file was written despite the value being invalid")
+	}
+}
+
+func TestRunSetUnknownSetting(t *testing.T) {
+	path := writeDefaultConfig(t)
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--set", "cache.ttl=5m", "--config", path}, &out, &errOut); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(errOut.String(), "--settings") {
+		t.Fatalf("the error does not point at the catalogue: %q", errOut.String())
+	}
+}
+
+// A password is not printed back, however it is asked for.
+func TestSecretsAreNotPrinted(t *testing.T) {
+	path := writeDefaultConfig(t)
+
+	var out, errOut bytes.Buffer
+	if code := run([]string{"--get", "backend.password", "--config", path}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code = %d", code)
+	}
+	if strings.Contains(out.String(), "change-me") {
+		t.Fatalf("--get printed the password: %q", out.String())
+	}
+
+	out.Reset()
+	if code := run([]string{"--settings", "--config", path}, &out, &errOut); code != 0 {
+		t.Fatalf("--settings exit code = %d", code)
+	}
+	if strings.Contains(out.String(), "change-me") {
+		t.Fatal("--settings printed the password")
+	}
+	if !strings.Contains(out.String(), "cache.default_ttl") {
+		t.Fatal("--settings did not list the settings")
+	}
+}
+
 func TestRunCheckConfigFails(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "broken.yaml")
 	if err := os.WriteFile(path, []byte("listen:\n  addres: \"0.0.0.0:3306\"\n"), 0o600); err != nil {

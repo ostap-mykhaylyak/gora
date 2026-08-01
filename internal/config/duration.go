@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -17,8 +18,18 @@ type Duration time.Duration
 // Std returns the standard library duration.
 func (d Duration) Std() time.Duration { return time.Duration(d) }
 
-// String makes Duration printable in logs and in the --check-config summary.
-func (d Duration) String() string { return time.Duration(d).String() }
+// String prints a duration the way the configuration file writes it: "10m",
+// not "10m0s". What `gora --get` prints is what you would type back.
+func (d Duration) String() string {
+	s := time.Duration(d).String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
+}
 
 // UnmarshalYAML accepts "30s"-style strings and the bare 0.
 //

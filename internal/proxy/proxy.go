@@ -33,7 +33,6 @@ type Options struct {
 	Listen   config.Listen
 	Users    []config.User
 	PoolCfg  config.Pool
-	Routing  config.Routing
 	Topology *topology.Topology
 	Cache    *cache.Cache // nil disables the query cache
 	Rewriter *rewrite.Rewriter
@@ -51,7 +50,6 @@ type Server struct {
 	drain      time.Duration
 	topo       *topology.Topology
 	cfg        config.Pool
-	routing    config.Routing
 	cache      *cache.Cache
 	rewriter   *rewrite.Rewriter
 	firewall   *firewall.Firewall
@@ -100,7 +98,6 @@ func New(o Options) *Server {
 		drain:      o.Listen.DrainTimeout.Std(),
 		topo:       o.Topology,
 		cfg:        o.PoolCfg,
-		routing:    o.Routing,
 		cache:      o.Cache,
 		rewriter:   o.Rewriter,
 		firewall:   o.Firewall,

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ostap-mykhaylyak/gora/internal/config"
@@ -31,7 +32,7 @@ const reconcileInterval = 5 * time.Second
 
 // Manager configures and governs the cluster.
 type Manager struct {
-	cfg  config.Replication
+	cfg  atomic.Pointer[config.Replication]
 	topo *topology.Topology
 	log  *slog.Logger
 
@@ -57,13 +58,22 @@ type NodeStatus struct {
 // New builds the manager. The cluster state — who is the primary, which
 // nodes exist — belongs to the topology, which has already read it.
 func New(cfg config.Replication, topo *topology.Topology, log *slog.Logger) (*Manager, error) {
-	return &Manager{
-		cfg:    cfg,
+	m := &Manager{
 		topo:   topo,
 		log:    log,
 		status: make(map[string]NodeStatus),
-	}, nil
+	}
+	m.cfg.Store(&cfg)
+	return m, nil
 }
+
+// conf returns the settings in force.
+func (m *Manager) conf() config.Replication { return *m.cfg.Load() }
+
+// SetConfig replaces them while gora runs. Switching failover from manual
+// to automatic during an incident is exactly when a restart is least
+// welcome.
+func (m *Manager) SetConfig(cfg config.Replication) { m.cfg.Store(&cfg) }
 
 // Status returns what each node last said about its replication.
 func (m *Manager) Status() []NodeStatus {
@@ -142,11 +152,11 @@ func (m *Manager) watchPrimary(ctx context.Context, primary *topology.Node) {
 	down := time.Since(m.downSince)
 	m.mu.Unlock()
 
-	if down < m.cfg.FailoverDelay.Std() {
+	if down < m.conf().FailoverDelay.Std() {
 		return
 	}
 
-	if m.cfg.Failover != config.FailoverAutomatic {
+	if m.conf().Failover != config.FailoverAutomatic {
 		// Said once per reconcile while it lasts: an operator reading the
 		// log during an outage should find the sentence that tells them
 		// what gora is waiting for.

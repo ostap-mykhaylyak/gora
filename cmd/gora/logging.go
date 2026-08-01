@@ -35,22 +35,30 @@ func openLog(cfg config.Log) (io.Writer, func(), error) {
 	return f, func() { _ = f.Close() }, nil
 }
 
-func newLogger(w io.Writer, cfg config.Log) *slog.Logger {
-	var level slog.Level
-	switch cfg.Level {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
-	}
+// logLevel is the level in force, held in a variable the handler consults
+// on every record: turning the log up to debug during an incident is the
+// least welcome moment to restart the thing you are trying to observe.
+var logLevel = new(slog.LevelVar)
 
-	opts := &slog.HandlerOptions{Level: level}
+func newLogger(w io.Writer, cfg config.Log) *slog.Logger {
+	logLevel.Set(levelOf(cfg.Level))
+
+	opts := &slog.HandlerOptions{Level: logLevel}
 	if cfg.Format == "json" {
 		return slog.New(slog.NewJSONHandler(w, opts))
 	}
 	return slog.New(slog.NewTextHandler(w, opts))
+}
+
+func levelOf(name string) slog.Level {
+	switch name {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }

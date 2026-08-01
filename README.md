@@ -173,6 +173,12 @@ gora top                      # watch what it is doing, refreshed live
 ```sh
 gora --init                   # install as a systemd service
 gora --check-config           # validate the configuration and exit
+gora --settings               # every setting, its value and when it applies
+gora --set cache.default_ttl=10m
+gora --get cache.default_ttl
+gora --unset listen.tls.cert
+gora --add-user wordpress     # asks for the password
+gora --remove-user wordpress
 gora --advice                 # print what the profiler has suggested
 gora --init-cluster                     # set the servers up as a cluster
 gora --add-replica 10.0.0.11:3306       # bring a node in, live
@@ -350,6 +356,53 @@ behave the way the numbers suggest. Names must be unique within a section.
 Only cache queries whose answer is the same for every visitor. Never cache
 per-customer data — carts, sessions, orders.
 
+## Configuration from the command line
+
+Every setting has a dotted name and can be read, changed and removed without
+opening an editor:
+
+```sh
+gora --settings                          # all of them, with their values
+gora --get cache.default_ttl
+gora --set cache.default_ttl=10m
+gora --unset listen.tls.cert             # back to the default
+```
+
+This is also how the first database is configured, on a fresh install:
+
+```sh
+sudo gora --set backend.address=10.0.0.10:3306
+sudo gora --set backend.username=wordpress
+sudo gora --set backend.password=-       # typed in, not left in the shell history
+sudo gora --check-config
+sudo systemctl enable --now gora
+```
+
+A value of `-` is read from the terminal instead of the command line, which
+is where a password would otherwise stay for as long as the history file
+does. Passwords are never printed back by `--get` or `--settings`.
+
+Three things happen that an editor does not do:
+
+- **The change is validated before it is written.** A value gora would
+  refuse to start with never reaches the file, so a configuration gora
+  wrote is a configuration gora can start with.
+- **The file is edited, not regenerated.** Only the line being changed is
+  touched: comments, blank lines and the alignment of the explanations come
+  out exactly as they went in. A key or a whole section that is missing is
+  created in place.
+- **A running gora is told.** `--settings` says which settings take effect
+  on reload and which need a restart; for the first kind, `--set` signals
+  the running instance and reports that it is already in force.
+
+The accounts clients authenticate with are a list, so they have their own
+commands:
+
+```sh
+sudo gora --add-user wordpress           # asks for the password
+sudo gora --remove-user wordpress
+```
+
 ## Growing from one server
 
 Start with one. `backend.replicas` empty is a complete configuration, and
@@ -424,6 +477,7 @@ What to look at, and what it means:
 | a replica with `READS no` | it is down, further behind than `max_replica_lag`, or its lag could not be read at all |
 | `LAG ?` | gora could not read the replication status — usually the proxy account is missing `REPLICATION CLIENT` |
 | the primary in state `RO` | it has become read-only. Something failed over without telling gora; writes are being refused |
+| a setting that seems ignored | `gora --settings` says whether it applies on reload or needs a restart |
 | pool waits above zero in `gora status` | `pool.max_open` is too small for the traffic, or statements are holding connections too long |
 | a low cache hit ratio | the ratio only counts cacheable traffic, so a low one means the entries are being invalidated faster than they are used — usually a write-heavy table in an `invalidate_on` list |
 | `REPLICATION STOPPED` | the replica hit an error applying something; `gora status` prints it |

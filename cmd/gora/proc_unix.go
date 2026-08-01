@@ -4,6 +4,8 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"syscall"
 )
 
@@ -18,3 +20,20 @@ func processAlive(pid int) bool {
 func terminate(pid int) error { return syscall.Kill(pid, syscall.SIGTERM) }
 
 func hangup(pid int) error { return syscall.Kill(pid, syscall.SIGHUP) }
+
+// copyOwner gives dst the same owner as src, so rewriting a file gora runs
+// as an unprivileged user does not leave it owned by root.
+func copyOwner(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return nil // nothing to copy from
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	if err := os.Chown(dst, int(st.Uid), int(st.Gid)); err != nil {
+		return fmt.Errorf("keeping the owner of %s: %w", src, err)
+	}
+	return nil
+}

@@ -27,9 +27,9 @@ type admin struct {
 // connect opens an administrative connection and works out which
 // replication vocabulary the server speaks.
 func (m *Manager) connect(ctx context.Context, addr string) (*admin, error) {
-	c, err := client.ConnectWithContext(ctx, addr, m.cfg.AdminUsername, m.cfg.AdminPassword, "", adminTimeout)
+	c, err := client.ConnectWithContext(ctx, addr, m.conf().AdminUsername, m.conf().AdminPassword, "", adminTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("connecting to %s as %s: %w", addr, m.cfg.AdminUsername, err)
+		return nil, fmt.Errorf("connecting to %s as %s: %w", addr, m.conf().AdminUsername, err)
 	}
 
 	version, err := scalarString(c, "SELECT VERSION()")

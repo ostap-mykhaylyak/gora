@@ -64,6 +64,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err = addReplica(opts.configPath, opts.addReplica, stdout)
 	case opts.removeReplica != "":
 		err = removeReplica(opts.configPath, opts.removeReplica, stdout)
+	case opts.settings:
+		err = listSettings(opts.configPath, stdout)
+	case opts.get != "":
+		err = getSetting(opts.configPath, opts.get, stdout)
+	case opts.set != "":
+		err = setSetting(opts.configPath, opts.set, stdout)
+	case opts.unset != "":
+		err = unsetSetting(opts.configPath, opts.unset, stdout)
+	case opts.addUser != "":
+		err = addUser(opts.configPath, opts.addUser, stdout)
+	case opts.removeUser != "":
+		err = removeUser(opts.configPath, opts.removeUser, stdout)
 	default:
 		switch opts.command {
 		case "start":

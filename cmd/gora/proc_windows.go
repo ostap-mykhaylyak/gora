@@ -24,3 +24,7 @@ func processAlive(pid int) bool {
 func terminate(int) error { return errWindows }
 
 func hangup(int) error { return errWindows }
+
+// copyOwner is a Unix concern; on Windows the file keeps whatever the
+// filesystem gives it.
+func copyOwner(src, dst string) error { return nil }

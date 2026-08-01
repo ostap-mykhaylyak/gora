@@ -88,7 +88,7 @@ type NodeStats struct {
 
 // Topology is the set of nodes gora forwards to.
 type Topology struct {
-	cfg     config.Routing
+	cfg     atomic.Pointer[config.Routing]
 	backend config.Backend
 	poolCfg config.Pool
 	log     *slog.Logger
@@ -119,7 +119,6 @@ type Topology struct {
 // keeps them in memory, which means they last until gora restarts.
 func New(backend config.Backend, poolCfg config.Pool, routing config.Routing, statePath string, log *slog.Logger) (*Topology, error) {
 	t := &Topology{
-		cfg:                routing,
 		backend:            backend,
 		poolCfg:            poolCfg,
 		log:                log,
@@ -127,6 +126,7 @@ func New(backend config.Backend, poolCfg config.Pool, routing config.Routing, st
 		configuredReplicas: backend.Replicas,
 		stop:               make(chan struct{}),
 	}
+	t.cfg.Store(&routing)
 	if err := t.state.Load(); err != nil {
 		return nil, err
 	}
@@ -179,6 +179,22 @@ func (t *Topology) newNode(backend config.Backend, addr string, role Role, poolC
 	n.up.Store(true)
 	n.lagSeconds.Store(-1)
 	return n, nil
+}
+
+// Routing returns the settings in force; one atomic load per read that
+// needs them.
+func (t *Topology) Routing() config.Routing { return *t.cfg.Load() }
+
+func (t *Topology) routing() config.Routing { return t.Routing() }
+
+// SetRouting replaces the routing settings while gora runs. The health
+// interval is not among them: its ticker was started once, and a setting
+// that only takes effect after a restart is better refused than silently
+// half-applied.
+func (t *Topology) SetRouting(routing config.Routing) {
+	current := t.routing()
+	routing.HealthInterval = current.HealthInterval
+	t.cfg.Store(&routing)
 }
 
 // Primary returns the node writes go to.
@@ -287,7 +303,7 @@ func (t *Topology) eligible(n *Node) bool {
 	if !n.up.Load() {
 		return false
 	}
-	if t.cfg.MaxReplicaLag <= 0 {
+	if t.routing().MaxReplicaLag <= 0 {
 		return true
 	}
 	lag := n.lagSeconds.Load()
@@ -296,7 +312,7 @@ func (t *Topology) eligible(n *Node) bool {
 		// it would mean serving reads from a node that may be a day behind.
 		return false
 	}
-	return time.Duration(lag)*time.Second <= t.cfg.MaxReplicaLag.Std()
+	return time.Duration(lag)*time.Second <= t.routing().MaxReplicaLag.Std()
 }
 
 // WritesAccepted reports whether the primary can currently take a write.
@@ -355,7 +371,7 @@ func (t *Topology) Run(ctx context.Context) {
 	// anything means routing blind for exactly as long as the interval.
 	t.checkAll(ctx)
 
-	ticker := time.NewTicker(t.cfg.HealthInterval.Std())
+	ticker := time.NewTicker(t.routing().HealthInterval.Std())
 	defer ticker.Stop()
 	for {
 		select {

@@ -76,7 +76,7 @@ func (c *Cache) StorePaired(db, query string, r *mysql.Result) {
 		return
 	}
 	size := resultSize(r)
-	if size > c.cfg.MaxResultBytes {
+	if size > c.conf().MaxResultBytes {
 		return
 	}
 

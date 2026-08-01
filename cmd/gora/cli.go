@@ -33,6 +33,12 @@ Options (always two dashes):
   --check-config  validate the configuration and exit
   --advice        print what the profiler has suggested, and exit
   --json          with status: print the raw snapshot instead of a report
+  --settings              list every setting, its value and when it applies
+  --get <setting>         print one setting
+  --set <setting>=<value> change one setting (a value of - is read from stdin)
+  --unset <setting>       remove one setting, back to its default
+  --add-user <name>       add an account clients authenticate with
+  --remove-user <name>    remove one
   --init-cluster  configure the servers into a replicating cluster and exit
   --add-replica <addr>    bring a node into the cluster, without a restart
   --remove-replica <addr> take a node out of the cluster, without a restart
@@ -55,6 +61,12 @@ type options struct {
 	removeReplica string
 	promote       string
 	asJSON        bool
+	settings      bool
+	get           string
+	set           string
+	unset         string
+	addUser       string
+	removeUser    string
 	version       bool
 	help          bool
 }
@@ -98,6 +110,34 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.advice = true
+			case "settings":
+				if err := noValue(name, hasValue); err != nil {
+					return opts, err
+				}
+				opts.settings = true
+			case "get", "set", "unset", "add-user", "remove-user":
+				if !hasValue {
+					i++
+					if i >= len(args) {
+						return opts, fmt.Errorf("--%s needs a value", name)
+					}
+					value = args[i]
+				}
+				if value == "" {
+					return opts, fmt.Errorf("--%s needs a value", name)
+				}
+				switch name {
+				case "get":
+					opts.get = value
+				case "set":
+					opts.set = value
+				case "unset":
+					opts.unset = value
+				case "add-user":
+					opts.addUser = value
+				case "remove-user":
+					opts.removeUser = value
+				}
 			case "json":
 				if err := noValue(name, hasValue); err != nil {
 					return opts, err
@@ -169,6 +209,12 @@ func parseArgs(args []string) (options, error) {
 		"--promote":        opts.promote != "",
 		"--add-replica":    opts.addReplica != "",
 		"--remove-replica": opts.removeReplica != "",
+		"--settings":       opts.settings,
+		"--get":            opts.get != "",
+		"--set":            opts.set != "",
+		"--unset":          opts.unset != "",
+		"--add-user":       opts.addUser != "",
+		"--remove-user":    opts.removeUser != "",
 	}
 	var chosen []string
 	for name, on := range actions {

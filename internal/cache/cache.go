@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -60,7 +61,11 @@ const (
 
 // Cache is safe for concurrent use by every session.
 type Cache struct {
-	cfg  config.Cache
+	// cfg is swapped, not mutated: the tuning settings — sizes, TTL, which
+	// built-ins are on — can change while gora runs, and every reader takes
+	// the whole thing at once rather than half of an old one and half of a
+	// new one.
+	cfg  atomic.Pointer[config.Cache]
 	pool *pool.Pool
 	log  *slog.Logger
 
@@ -129,7 +134,6 @@ type sourceStat struct {
 // placeholders still in place.
 func New(cfg config.Cache, p *pool.Pool, rawRules []Rule, log *slog.Logger) (*Cache, error) {
 	c := &Cache{
-		cfg:      cfg,
 		pool:     p,
 		log:      log,
 		rawRules: rawRules,
@@ -140,6 +144,7 @@ func New(cfg config.Cache, p *pool.Pool, rawRules []Rule, log *slog.Logger) (*Ca
 		learned:  make(map[string]string),
 		inflight: make(map[string]*call),
 	}
+	c.cfg.Store(&cfg)
 	if cfg.TablePrefix != config.AutoPrefix {
 		if err := c.bindPrefix(cfg.TablePrefix); err != nil {
 			return nil, err
@@ -161,6 +166,15 @@ func (c *Cache) bindPrefix(prefix string) error {
 	c.rulesMu.Unlock()
 	return nil
 }
+
+// conf returns the settings in force. It is one atomic load, on paths that
+// run for every cacheable statement.
+func (c *Cache) conf() config.Cache { return *c.cfg.Load() }
+
+// SetConfig replaces the tuning settings. Entries already held are left
+// alone: a smaller budget is enforced by the next insertion rather than by
+// throwing away what is currently answering queries.
+func (c *Cache) SetConfig(cfg config.Cache) { c.cfg.Store(&cfg) }
 
 // SetRules replaces the conf.d rules (hot reload) and flushes the cache:
 // entries may descend from rules that no longer exist.
@@ -403,7 +417,7 @@ func (c *Cache) store(k, db, query string, r *mysql.Result, ttl time.Duration, t
 		return
 	}
 	size := resultSize(r)
-	if size > c.cfg.MaxResultBytes {
+	if size > c.conf().MaxResultBytes {
 		return
 	}
 
@@ -427,7 +441,7 @@ func (c *Cache) insertLocked(k string, r *mysql.Result, ttl time.Duration, tags 
 	if old, exists := c.entries[k]; exists {
 		c.removeLocked(old)
 	}
-	for c.lru.Len() >= c.cfg.MaxEntries {
+	for c.lru.Len() >= c.conf().MaxEntries {
 		c.removeLocked(c.lru.Back().Value.(*entry))
 	}
 
@@ -462,7 +476,7 @@ func (c *Cache) insertLocked(k string, r *mysql.Result, ttl time.Duration, tags 
 
 	// Byte budget: a thousand small entries and a thousand large ones cost
 	// very different amounts of memory, so max_entries alone cannot bound it.
-	for c.cfg.MaxBytes > 0 && c.bytes > c.cfg.MaxBytes && c.lru.Len() > 1 {
+	for c.conf().MaxBytes > 0 && c.bytes > c.conf().MaxBytes && c.lru.Len() > 1 {
 		c.removeLocked(c.lru.Back().Value.(*entry))
 	}
 	return e
@@ -489,17 +503,17 @@ func (c *Cache) classify(pats *patterns, rules []Rule, db, query string) (time.D
 		return 0, nil, "", false
 	}
 
-	if c.cfg.AutoloadOptions && pats.autoload.MatchString(query) {
-		return c.cfg.DefaultTTL.Std(), []string{
+	if c.conf().AutoloadOptions && pats.autoload.MatchString(query) {
+		return c.conf().DefaultTTL.Std(), []string{
 			tagAlloptions(db),
 			tagTable(db, pats.optionsTable),
 		}, sourceAlloptions, true
 	}
 
-	if c.cfg.Transients {
+	if c.conf().Transients {
 		if m := pats.option.FindStringSubmatch(query); m != nil {
 			if isTransientName(m[1]) {
-				return c.cfg.DefaultTTL.Std(), []string{
+				return c.conf().DefaultTTL.Std(), []string{
 					tagOption(db, m[1]),
 					tagTable(db, pats.optionsTable),
 				}, sourceTransients, true
@@ -525,7 +539,7 @@ func (c *Cache) classify(pats *patterns, rules []Rule, db, query string) (time.D
 					tags = append(tags, tagOption(db, n))
 				}
 				if allTransient {
-					return c.cfg.DefaultTTL.Std(), tags, sourceTransients, true
+					return c.conf().DefaultTTL.Std(), tags, sourceTransients, true
 				}
 			}
 		}
@@ -542,7 +556,7 @@ func (c *Cache) matchRules(rules []Rule, db, query string) (time.Duration, []str
 		}
 		ttl := r.TTL.Std()
 		if ttl <= 0 {
-			ttl = c.cfg.DefaultTTL.Std()
+			ttl = c.conf().DefaultTTL.Std()
 		}
 		tags := make([]string, 0, len(r.InvalidateOn))
 		for _, table := range r.InvalidateOn {

@@ -162,7 +162,6 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		Listen:   cfg.Listen,
 		Users:    cfg.Users,
 		PoolCfg:  cfg.Pool,
-		Routing:  cfg.Routing,
 		Topology: topo,
 		Cache:    queryCache,
 		Rewriter: traffic.rewriter,
@@ -205,7 +204,15 @@ func serve(ctx context.Context, cfg config.Config, configPath string, log *slog.
 		}()
 	}
 
-	go watchReloads(ctx, configPath, rulesDir, queryCache, traffic, log)
+	go watchReloads(ctx, reloadable{
+		configPath: configPath,
+		rulesDir:   rulesDir,
+		cache:      queryCache,
+		traffic:    traffic,
+		topo:       topo,
+		replicator: replicator,
+		log:        log,
+	})
 
 	if err := srv.Run(ctx); err != nil {
 		return err
@@ -244,7 +251,18 @@ func rulesDirFor(cfg config.Config, configPath string) string {
 // pool and credentials are not swapped under running sessions. The rules
 // are the part meant to change while gora runs, which is what makes adding
 // one during an incident a `systemctl reload` away.
-func watchReloads(ctx context.Context, configPath, rulesDir string, queryCache *cache.Cache, tr *traffic, log *slog.Logger) {
+// reloadable is everything a SIGHUP can change without a restart.
+type reloadable struct {
+	configPath string
+	rulesDir   string
+	cache      *cache.Cache
+	traffic    *traffic
+	topo       *topology.Topology
+	replicator *replication.Manager
+	log        *slog.Logger
+}
+
+func watchReloads(ctx context.Context, r reloadable) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
@@ -255,33 +273,51 @@ func watchReloads(ctx context.Context, configPath, rulesDir string, queryCache *
 			return
 		case <-hup:
 		}
-
-		cfg, err := config.Load(configPath)
-		if err != nil {
-			log.Error("reload failed, the running configuration is unchanged", "error", err)
-			continue
-		}
-		rules, err := confd.Load(rulesDir)
-		if err != nil {
-			log.Error("reload failed, keeping the previous rules", "error", err)
-			continue
-		}
-		// The traffic rules go first: they compile without touching the
-		// cache, so a bad expression is caught before anything is flushed.
-		if err := tr.setRules(rules, cfg.Cache.TablePrefix); err != nil {
-			log.Error("reload failed, keeping the previous rules", "error", err)
-			continue
-		}
-		if queryCache != nil {
-			if err := queryCache.SetRules(rules.Cache); err != nil {
-				log.Error("reload failed, keeping the previous rules", "error", err)
-				continue
-			}
-		}
-		log.Info("configuration reloaded", "config", configPath, "rules_dir", rulesDir,
-			"cache_rules", len(rules.Cache), "rewrites", len(rules.Rewrites),
-			"blocks", len(rules.Blocks), "throttles", len(rules.Throttles))
+		r.apply()
 	}
+}
+
+// apply re-reads the configuration and the drop-ins, and puts into effect
+// the part that can change under a running proxy.
+//
+// Nothing is applied unless everything parses: a reload that leaves half
+// the new configuration in force and half the old one is worse than a
+// reload that did nothing, because nobody can tell which half they have.
+func (r reloadable) apply() {
+	cfg, err := config.Load(r.configPath)
+	if err != nil {
+		r.log.Error("reload failed, the running configuration is unchanged", "error", err)
+		return
+	}
+	rules, err := confd.Load(r.rulesDir)
+	if err != nil {
+		r.log.Error("reload failed, keeping the previous rules", "error", err)
+		return
+	}
+	// The traffic rules go first: they compile without touching the cache,
+	// so a bad expression is caught before anything is flushed.
+	if err := r.traffic.setRules(rules, cfg.Cache.TablePrefix); err != nil {
+		r.log.Error("reload failed, keeping the previous rules", "error", err)
+		return
+	}
+	if r.cache != nil {
+		if err := r.cache.SetRules(rules.Cache); err != nil {
+			r.log.Error("reload failed, keeping the previous rules", "error", err)
+			return
+		}
+		r.cache.SetConfig(cfg.Cache)
+	}
+
+	r.topo.SetRouting(cfg.Routing)
+	if r.replicator != nil {
+		r.replicator.SetConfig(cfg.Replication)
+	}
+	logLevel.Set(levelOf(cfg.Log.Level))
+
+	r.log.Info("configuration reloaded", "config", r.configPath, "rules_dir", r.rulesDir,
+		"log_level", cfg.Log.Level,
+		"cache_rules", len(rules.Cache), "rewrites", len(rules.Rewrites),
+		"blocks", len(rules.Blocks), "throttles", len(rules.Throttles))
 }
 
 // stop asks the running instance to shut down and waits for it to be gone.

@@ -257,13 +257,13 @@ func setGlobal(a *admin, name, value string) error {
 
 // createReplicationUser creates the account the replicas connect with.
 func (m *Manager) createReplicationUser(a *admin, out io.Writer) error {
-	user := m.cfg.User
-	if err := a.exec("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'", user, escape(m.cfg.Password)); err != nil {
+	user := m.conf().User
+	if err := a.exec("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'", user, escape(m.conf().Password)); err != nil {
 		return err
 	}
 	// The password is set explicitly as well, so re-running --init-cluster
 	// after changing it in the configuration does what it looks like it does.
-	if err := a.exec("ALTER USER '%s'@'%%' IDENTIFIED BY '%s'", user, escape(m.cfg.Password)); err != nil {
+	if err := a.exec("ALTER USER '%s'@'%%' IDENTIFIED BY '%s'", user, escape(m.conf().Password)); err != nil {
 		return err
 	}
 	if err := a.exec("GRANT REPLICATION SLAVE ON *.* TO '%s'@'%%'", user); err != nil {
@@ -293,8 +293,8 @@ func (m *Manager) startReplication(a *admin, primaryAddr string, out io.Writer) 
 		d.changeSource(),
 		d.opt("HOST"), host,
 		d.opt("PORT"), port,
-		d.opt("USER"), m.cfg.User,
-		d.opt("PASSWORD"), escape(m.cfg.Password),
+		d.opt("USER"), m.conf().User,
+		d.opt("PASSWORD"), escape(m.conf().Password),
 		d.opt("AUTO_POSITION"))
 	if atLeast(a.version, 8, 0, 0) {
 		stmt += ", " + d.opt("SSL") + " = 0, GET_" + d.opt("PUBLIC_KEY") + " = 1"
@@ -327,7 +327,7 @@ func (m *Manager) clone(ctx context.Context, a *admin, primaryAddr string, out i
 	// CLONE ends by restarting the server, so losing the connection here is
 	// the expected outcome, not a failure.
 	if err := a.exec("CLONE INSTANCE FROM '%s'@'%s':%s IDENTIFIED BY '%s'",
-		m.cfg.User, host, port, escape(m.cfg.Password)); err != nil {
+		m.conf().User, host, port, escape(m.conf().Password)); err != nil {
 		if !isDisconnect(err) {
 			return err
 		}
